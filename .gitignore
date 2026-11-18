@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# 运行产物（出图、扫参原始图、日志）
+out/
+studio/out/
+*.log
+
+# 本机配置与用户预设（含本机端口 / ComfyUI 路径，不随仓库分发）
+studio/state/config.json
+studio/state/presets.json
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+.DS_Store

@@ -1,0 +1,238 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>SDXL 相机工作台</title>
+<link rel="icon" href="data:," />
+<link rel="stylesheet" href="/styles.css" />
+<script type="importmap">
+{"imports":{"three":"/vendor/three.module.js"}}
+</script>
+</head>
+<body>
+<div class="app">
+
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true"></span>
+      <span class="brand-name">SDXL 相机工作台</span>
+      <span class="brand-sub">Camera Angle Studio</span>
+    </div>
+    <div class="conn" title="ComfyUI 连接状态">
+      <span class="dot"></span>
+      <span class="conn-text">检测中…</span>
+    </div>
+    <div class="top-actions">
+      <label class="field-inline">
+        <span>预设</span>
+        <select id="preset" title="选择预设机位"></select>
+      </label>
+      <button id="btn_save_preset" class="btn ghost" title="把当前机位保存为预设">保存预设</button>
+      <button id="btn_reset" class="btn ghost" title="恢复默认机位与参数">复位</button>
+      <button id="btn_open_folder" class="btn ghost" title="在资源管理器打开输出目录">输出目录</button>
+    </div>
+  </header>
+
+  <main class="layout">
+
+    <section class="pane pane-left">
+      <div class="viewport">
+        <canvas id="view3d"></canvas>
+        <div class="vp-tip">左键拖 = 旋转场景 · Shift/右键拖 = 平移 · 拖粉点改方位 · 拖青点改高度 · 滚轮改距离</div>
+      </div>
+
+      <div class="sliderbar">
+        <div class="slider-head">
+          <span>相机参数</span>
+          <span class="hint">改动即重算提示词（200ms 防抖）</span>
+        </div>
+        <div class="slider-grid">
+
+          <div class="srow">
+            <label for="pos_x">方位 pos_x</label>
+            <input type="range" id="pos_x" min="-1" max="1" step="0.01" value="0" />
+            <span class="val" id="vx" data-val="pos_x">0.000</span>
+          </div>
+          <div class="srow">
+            <label for="pos_y">高度 pos_y</label>
+            <input type="range" id="pos_y" min="-1" max="1" step="0.01" value="0" />
+            <span class="val" id="vy" data-val="pos_y">0.000</span>
+          </div>
+          <div class="srow">
+            <label for="pos_z">距离 pos_z</label>
+            <input type="range" id="pos_z" min="-1" max="1" step="0.01" value="0" />
+            <span class="val" id="vz" data-val="pos_z">0.000</span>
+          </div>
+          <div class="srow">
+            <label for="roll">倾斜 roll</label>
+            <input type="range" id="roll" min="0" max="1" step="0.01" value="0" />
+            <span class="val" id="vr" data-val="roll">0.000</span>
+          </div>
+
+          <div class="srow">
+            <label for="strength">强度 strength</label>
+            <input type="range" id="strength" min="0" max="2" step="0.01" value="1" />
+            <span class="val" data-val="strength">1.00</span>
+          </div>
+          <div class="srow">
+            <label for="neg_strength">负向强度</label>
+            <input type="range" id="neg_strength" min="0" max="2" step="0.01" value="1" />
+            <span class="val" data-val="neg_strength">1.00</span>
+          </div>
+
+          <div class="srow sel">
+            <label for="weight_mode">权重曲线</label>
+            <select id="weight_mode" data-enum="weight_mode"></select>
+            <span class="val ghost"></span>
+          </div>
+          <div class="srow sel">
+            <label for="azimuth_mode">方位精度</label>
+            <select id="azimuth_mode" data-enum="azimuth_mode"></select>
+            <span class="val ghost"></span>
+          </div>
+          <div class="srow sel">
+            <label for="elevation_mode">高度精度</label>
+            <select id="elevation_mode" data-enum="elevation_mode"></select>
+            <span class="val ghost"></span>
+          </div>
+
+          <div class="srow wide">
+            <label for="extra_positive">额外正向词</label>
+            <input type="text" id="extra_positive" placeholder="拼进正向提示词末尾，如 1girl, solo" />
+          </div>
+          <div class="srow wide">
+            <label for="extra_negative">额外负向词</label>
+            <input type="text" id="extra_negative" placeholder="拼进负向提示词末尾，如 blurry, watermark" />
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="pane pane-right">
+
+      <div class="card">
+        <div class="card-head">
+          <h2>正向提示词</h2>
+          <button id="btn_copy_pos" class="btn mini" title="复制正向提示词">复制</button>
+        </div>
+        <div id="positive_out" class="prompt-text">等待预览…</div>
+        <div class="card-head sub">
+          <h2>负向提示词</h2>
+          <button id="btn_copy_neg" class="btn mini" title="复制负向提示词">复制</button>
+        </div>
+        <div id="negative_out" class="prompt-text neg">等待预览…</div>
+        <div class="info-row">
+          <span id="info_out" class="info">—</span>
+          <span id="token_badge" class="badge">P 0 · N 0</span>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-head">
+          <h2>手动附加</h2>
+          <span class="hint">追加到提示词末尾（不经权重处理）</span>
+        </div>
+        <div class="field-grid">
+          <label class="field">
+            <span>手动正向</span>
+            <textarea id="manual_positive" rows="2" placeholder="例如 masterpiece, best quality"></textarea>
+          </label>
+          <label class="field">
+            <span>手动负向</span>
+            <textarea id="manual_negative" rows="2" placeholder="例如 lowres, bad anatomy"></textarea>
+          </label>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-head">
+          <h2>生成设置</h2>
+          <span class="badge soft" data-badge="models">未连接 ComfyUI</span>
+        </div>
+        <div class="field-grid three">
+          <label class="field">
+            <span>seed（-1 随机）</span>
+            <input type="number" id="seed" step="1" value="-1" />
+          </label>
+          <label class="field chk">
+            <span>随机 seed</span>
+            <input type="checkbox" id="randomize" checked />
+          </label>
+          <label class="field">
+            <span>steps</span>
+            <input type="number" id="steps" min="1" max="120" step="1" value="28" />
+          </label>
+          <label class="field">
+            <span>cfg</span>
+            <input type="number" id="cfg" min="0" max="30" step="0.1" value="5" />
+          </label>
+          <label class="field">
+            <span>宽度</span>
+            <input type="number" id="width" min="256" max="2048" step="8" value="1024" />
+          </label>
+          <label class="field">
+            <span>高度</span>
+            <input type="number" id="height" min="256" max="2048" step="8" value="1024" />
+          </label>
+          <label class="field span2">
+            <span>checkpoint</span>
+            <select id="checkpoint"></select>
+          </label>
+          <label class="field span2">
+            <span>lora</span>
+            <select id="lora"></select>
+          </label>
+          <label class="field span2">
+            <span>lora 强度</span>
+            <input type="range" id="lora_strength" min="0" max="2" step="0.05" value="1" />
+            <span class="val" data-val="lora_strength">1.00</span>
+          </label>
+          <label class="field span2">
+            <span>工作流模板（可选）</span>
+            <select id="wf_template"></select>
+          </label>
+          <label class="field span2">
+            <span>姿势 id（模板变量 pose，留空用模板默认）</span>
+            <input type="text" id="pose_id" placeholder="例如 full_sexy_P001_front" />
+          </label>
+        </div>
+      </div>
+
+      <div class="card gen">
+        <div class="gen-row">
+          <button id="btn_generate" class="btn primary">生成图片</button>
+          <button id="btn_interrupt" class="btn" title="中断 ComfyUI 当前任务">中断</button>
+        </div>
+        <progress id="progressbar" max="100" value="0"></progress>
+        <div id="status" class="status">就绪</div>
+      </div>
+
+      <div class="card">
+        <div class="card-head">
+          <h2>画廊</h2>
+          <div class="head-actions">
+            <span class="badge soft" data-badge="gallery-count">0 张</span>
+            <button class="btn mini gallery-clear" title="清空输出目录中的画廊记录">清空</button>
+          </div>
+        </div>
+        <div id="gallery" class="gallery"></div>
+      </div>
+
+    </section>
+  </main>
+</div>
+
+<div id="lightbox" class="lightbox" hidden>
+  <div class="lb-stage">
+    <img class="lb-img" alt="生成图预览" />
+  </div>
+  <button class="lb-close" title="关闭 (Esc)">×</button>
+  <button class="lb-prev" title="上一张 (←)">‹</button>
+  <button class="lb-next" title="下一张 (→)">›</button>
+  <div class="lb-cap"></div>
+</div>
+
+<script type="module" src="/app.js"></script>
+</body>
+</html>

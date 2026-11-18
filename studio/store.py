@@ -1,0 +1,367 @@
+# -*- coding: utf-8 -*-
+"""SDXL 相机工作台 · 持久化层
+
+只管磁盘，不碰 HTTP、不碰 ComfyUI：
+
+- state/config.json   用户参数持久化
+- state/presets.json  用户保存的相机姿态（UI 预设）
+- out/                出图根目录 + 画廊索引（mtime 倒序）
+
+所有写盘都走「临时文件 + os.replace」，进程被杀也不会留下半个 JSON。
+只依赖标准库。
+"""
+
+import json
+import os
+import re
+import time
+import urllib.parse
+import uuid
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+ROOT = HERE.parent                      # sdxl_camera_angle/
+WEB_DIR = HERE / "web"
+STATE_DIR = HERE / "state"
+OUT_DIR = HERE / "out"
+CONFIG_PATH = STATE_DIR / "config.json"
+PRESETS_PATH = STATE_DIR / "presets.json"
+
+IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".webp")
+
+# 前端需要的全部默认值（缺字段时前端/后端都靠这份兜底）
+DEFAULT_CONFIG = {
+    # 相机
+    "pos_x": 0.0,
+    "pos_y": 0.0,
+    "pos_z": 0.0,
+    "roll": 0.0,
+    "preset": "自定义",
+    "strength": 1.0,
+    "weight_mode": "tanh",
+    "azimuth_mode": "8bin",
+    "elevation_mode": "3bin",
+    "neg_strength": 1.0,
+    "extra_positive": "",
+    "extra_negative": "",
+    "manual_positive": "",
+    "manual_negative": "",
+    # 采样
+    "seed": -1,
+    "randomize": True,
+    "steps": 28,
+    "cfg": 5.0,
+    "width": 832,
+    "height": 1216,
+    "sampler": "euler_ancestral",
+    "scheduler": "karras",
+    "checkpoint": "",
+    "lora_name": "",
+    "lora_strength": 0.8,
+    "batch": 1,
+    "save_prefix": "camera",
+    # 外部工作流模板（空 = 用内置最小图）
+    "workflow_template": "",
+    "negative_mode": "append",
+    "pose_id": "",
+    # 环境
+    "comfy_url": "http://127.0.0.1:8188",
+}
+
+
+# ══════════════════════ 目录与原子写 ══════════════════════
+def ensure_dirs():
+    """建好 state/ 与 out/（幂等）。"""
+    for d in (STATE_DIR, OUT_DIR):
+        try:
+            d.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
+    return {"state": str(STATE_DIR), "out": str(OUT_DIR)}
+
+
+def atomic_write_json(path, data):
+    """临时文件 + os.replace；同目录建临时文件，保证跨盘也不出错。"""
+    path = Path(path)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+    tmp = path.parent / ("%s.%s.tmp" % (path.name, uuid.uuid4().hex[:8]))
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, ensure_ascii=False, indent=2, sort_keys=True)
+            fh.flush()
+            try:
+                os.fsync(fh.fileno())
+            except OSError:
+                pass
+        os.replace(str(tmp), str(path))
+    finally:
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except OSError:
+            pass
+    return path
+
+
+def read_json(path, default=None):
+    """读 JSON；文件缺失/损坏都返回 default（损坏件改名留档，不覆盖用户数据）。"""
+    path = Path(path)
+    if not path.is_file():
+        return default
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        try:
+            path.replace(path.with_suffix(path.suffix + ".broken"))
+        except OSError:
+            pass
+        return default
+    return data
+
+
+# ══════════════════════ 类型归整 ══════════════════════
+def _as_bool(v):
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)):
+        return bool(v)
+    if isinstance(v, str):
+        return v.strip().lower() in ("1", "true", "yes", "on")
+    return bool(v)
+
+
+def _sanitize(defaults, data):
+    """按 defaults 的类型把 data 归整，多余键丢弃、缺失键补默认。"""
+    out = dict(defaults)
+    if not isinstance(data, dict):
+        return out
+    for key, dv in defaults.items():
+        if key not in data or data[key] is None:
+            continue
+        v = data[key]
+        if isinstance(dv, bool):
+            out[key] = _as_bool(v)
+        elif isinstance(dv, int):
+            try:
+                out[key] = int(float(v))
+            except (TypeError, ValueError):
+                pass
+        elif isinstance(dv, float):
+            try:
+                out[key] = float(v)
+            except (TypeError, ValueError):
+                pass
+        else:
+            out[key] = str(v)
+    return out
+
+
+# ══════════════════════ config ══════════════════════
+def load_config():
+    """返回完整配置（与 DEFAULT_CONFIG 同键集）。"""
+    return _sanitize(DEFAULT_CONFIG, read_json(CONFIG_PATH, {}))
+
+
+def save_config(config):
+    """整份保存，返回落盘后的配置。"""
+    cfg = _sanitize(DEFAULT_CONFIG, config)
+    ensure_dirs()
+    atomic_write_json(CONFIG_PATH, cfg)
+    return cfg
+
+
+def update_config(patch):
+    """按字段合并保存（前端只发变化的那几项）。"""
+    cur = load_config()
+    if isinstance(patch, dict):
+        for key, value in patch.items():
+            if key in DEFAULT_CONFIG:
+                cur[key] = value
+    return save_config(cur)
+
+
+# ══════════════════════ UI 预设 ══════════════════════
+def _coerce_vals(vals):
+    """[x, y, z, roll] → 4 个 float；不合法返回 None。"""
+    if not isinstance(vals, (list, tuple)) or len(vals) < 4:
+        return None
+    out = []
+    for v in list(vals)[:4]:
+        try:
+            out.append(round(float(v), 4))
+        except (TypeError, ValueError):
+            return None
+    return out
+
+
+def load_presets():
+    """{名字: [pos_x, pos_y, pos_z, roll]}"""
+    raw = read_json(PRESETS_PATH, {})
+    out = {}
+    if isinstance(raw, dict):
+        for name, vals in raw.items():
+            name = str(name).strip()[:40]
+            if not name:
+                continue
+            cv = _coerce_vals(vals)
+            if cv is not None:
+                out[name] = cv
+    return out
+
+
+def save_presets(presets):
+    data = {}
+    if isinstance(presets, dict):
+        for name, vals in presets.items():
+            name = str(name).strip()[:40]
+            cv = _coerce_vals(vals)
+            if name and cv is not None:
+                data[name] = cv
+    ensure_dirs()
+    atomic_write_json(PRESETS_PATH, data)
+    return data
+
+
+def set_ui_preset(name, vals):
+    """新增/覆盖一个用户预设；返回 (ok, 全量预设 或 错误串)。"""
+    name = str(name or "").strip()[:40]
+    if not name:
+        return False, "name 不能为空"
+    cv = _coerce_vals(vals)
+    if cv is None:
+        return False, "vals 必须是 4 个数字 [pos_x, pos_y, pos_z, roll]"
+    presets = load_presets()
+    presets[name] = cv
+    return True, save_presets(presets)
+
+
+def delete_ui_preset(name):
+    """删除用户预设；返回 (是否删掉了, 全量预设)。"""
+    name = str(name or "").strip()
+    presets = load_presets()
+    existed = name in presets
+    if existed:
+        presets.pop(name, None)
+        save_presets(presets)
+    return existed, presets
+
+
+# ══════════════════════ 输出目录 / 画廊 ══════════════════════
+_SAFE_STEM = re.compile("[^A-Za-z0-9._-]+")
+
+
+def unique_output_path(orig_name):
+    """<原名去扩展>_<短uuid>.png 落到 out/，绝不覆盖已有文件。"""
+    ensure_dirs()
+    stem = Path(str(orig_name or "image")).stem
+    stem = _SAFE_STEM.sub("_", stem).strip("._-")[:60] or "image"
+    while True:
+        dest = OUT_DIR / ("%s_%s.png" % (stem, uuid.uuid4().hex[:8]))
+        if not dest.exists():
+            return dest
+
+
+def out_rel(path):
+    """out/ 内的相对路径（用于 /api/view?local=…）。"""
+    path = Path(path)
+    try:
+        return os.path.relpath(str(path), str(OUT_DIR)).replace(os.sep, "/")
+    except ValueError:
+        return path.name
+
+
+def meta_path(image_path):
+    return Path(str(image_path) + ".json")
+
+
+def write_meta(image_path, meta):
+    """在图片旁边记一份 sidecar（seed 等），画廊用它显示角标。"""
+    if not isinstance(meta, dict):
+        return None
+    data = {k: v for k, v in meta.items() if v is not None}
+    try:
+        return atomic_write_json(meta_path(image_path), data)
+    except OSError:
+        return None
+
+
+def read_meta(image_path):
+    data = read_json(meta_path(image_path), {})
+    return data if isinstance(data, dict) else {}
+
+
+def list_gallery(limit=200):
+    """out/ 里所有图片，mtime 倒序，最多 limit 条。"""
+    ensure_dirs()
+    rows = []
+    try:
+        entries = list(OUT_DIR.iterdir())
+    except OSError:
+        return []
+    for entry in entries:
+        try:
+            if not entry.is_file():
+                continue
+            if entry.suffix.lower() not in IMAGE_EXTS:
+                continue
+            st = entry.stat()
+        except OSError:
+            continue
+        rel = out_rel(entry)
+        item = {
+            "url": "/api/view?local=" + urllib.parse.quote(rel),
+            "filename": entry.name,
+            "local": rel,
+            "mtime": round(st.st_mtime, 3),
+            "size": st.st_size,
+        }
+        meta = read_meta(entry)
+        if "seed" in meta:
+            item["seed"] = meta["seed"]
+        if "prompt_id" in meta:
+            item["prompt_id"] = meta["prompt_id"]
+        rows.append((st.st_mtime, item))
+    rows.sort(key=lambda kv: kv[0], reverse=True)
+    return [item for _, item in rows[:max(1, int(limit))]]
+
+
+def clear_gallery():
+    """删掉 out/ 里的图片与 sidecar，返回删除数量（其它文件不动）。"""
+    ensure_dirs()
+    removed = 0
+    try:
+        entries = list(OUT_DIR.iterdir())
+    except OSError:
+        return 0
+    for entry in entries:
+        try:
+            if not entry.is_file():
+                continue
+            low = entry.name.lower()
+            if entry.suffix.lower() in IMAGE_EXTS or low.endswith(".png.json") \
+                    or low.endswith(".jpg.json") or low.endswith(".jpeg.json") \
+                    or low.endswith(".webp.json"):
+                entry.unlink()
+                removed += 1
+        except OSError:
+            continue
+    return removed
+
+
+def now():
+    return time.time()
+
+
+__all__ = [
+    "HERE", "ROOT", "WEB_DIR", "STATE_DIR", "OUT_DIR", "CONFIG_PATH", "PRESETS_PATH",
+    "IMAGE_EXTS", "DEFAULT_CONFIG",
+    "ensure_dirs", "atomic_write_json", "read_json",
+    "load_config", "save_config", "update_config",
+    "load_presets", "save_presets", "set_ui_preset", "delete_ui_preset",
+    "unique_output_path", "out_rel", "write_meta", "read_meta",
+    "list_gallery", "clear_gallery", "meta_path", "now",
+]
