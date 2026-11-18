@@ -34,6 +34,12 @@ jobs:
       - name: Core unit tests
         run: python tests/test_core.py
 
+      - name: Template bridge unit tests
+        run: python tests/test_template_bridge.py
+
+      - name: Frontend static contract check (no browser needed)
+        run: python studio/tools/check_ui.py
+
       - name: Label parity check
         run: python tools/parity_check.py
 
