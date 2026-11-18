@@ -9,7 +9,9 @@
   3. app.js 里所有 fetch('/api/...') 路径都在契约 HTTP API 清单里（允许 ?query 与模板拼接）；
   4. index.html 有 importmap 指向 /js/three.module.js，且该文件存在且 > 1MB（v2 复用仓库根）；
   5. app.js / camera3d.js 不出现 OrbitControls、不出现 CDN 外链（允许 import 'three'），
-     并做一次括号配平（跳过字符串与注释）检查。
+     并做一次括号配平（跳过字符串与注释）检查；
+  6. v2.3 的 16 个新控件（导出 / ControlNet / 批量 / 模板）在 index.html、CONTRACT.md、
+     app.js 三处齐备，三个新接口与 renderDepthDataURL / renderPoseDataURL 都接上了线。
 
 用法：
     D:/QUARK/ComfyUI-aki-v3.2/python/python.exe D:/QUARK/sdxl_camera_angle/studio/tools/check_ui.py
@@ -37,6 +39,7 @@ CAM_JS = os.path.join(WEB_DIR, "camera3d.js")
 ROOT = os.path.dirname(STUDIO_DIR)                       # 仓库根
 THREE = os.path.join(ROOT, "js", "three.module.js")     # v2：复用仓库根的三件套
 CAMSHARED = os.path.join(ROOT, "js", "camera_shared.js")
+RIG_JS = os.path.join(ROOT, "js", "camera_rig.js")
 STYLES = os.path.join(WEB_DIR, "styles.css")
 
 RESULTS = []
@@ -438,6 +441,71 @@ def check_three_imports(js_files):
     return ok(name, "；".join(detail))
 
 
+V23_IDS = [
+    "btn_depth_export", "btn_pose_export", "depth_preview", "pose_preview",
+    "cn_auto_inject", "cn_kind_select", "cn_strength",
+    "template_select", "btn_template_inspect", "template_report",
+    "batch_name", "batch_seed", "batch_same_seed", "btn_batch_run",
+    "batch_grid", "batch_status",
+]
+V23_APIS = ["/api/templates/inspect", "/api/controlnet/upload", "/api/batch"]
+
+
+def check_v23_dom(html, contract_src, app_src):
+    """v2.3 的 16 个新控件：index.html 有、CONTRACT.md 登记了、app.js 又真的引用了。"""
+    name = "v2.3 新控件（DOM id / 契约登记 / app.js 引用）"
+    if not html:
+        return bad(name, "index.html 读不到")
+    ids_in_html = set(re.findall(r"""\bid\s*=\s*["']([^"']+)["']""", html))
+    missing_html = [i for i in V23_IDS if i not in ids_in_html]
+    missing_contract = [i for i in V23_IDS if contract_src and i not in contract_src]
+    missing_app = [i for i in V23_IDS if app_src and i not in app_src]
+    problems = []
+    if missing_html:
+        problems.append("index.html 缺 %d 个：%s" % (len(missing_html), ", ".join(missing_html)))
+    if missing_contract:
+        problems.append("CONTRACT.md 没登记：%s" % ", ".join(missing_contract))
+    if missing_app:
+        problems.append("app.js 没引用：%s" % ", ".join(missing_app))
+    if problems:
+        return bad(name, "；".join(problems))
+    return ok(name, "%d 个 v2.3 控件在 index.html / CONTRACT.md / app.js 三处齐" % len(V23_IDS))
+
+
+def check_v23_wiring(app_src, rig_srcs):
+    """三个新接口在 app.js 里被调用；离屏导出函数在 js/ 里有实现。"""
+    name = "v2.3 新接口 + 离屏导出接线"
+    problems = []
+    if not app_src:
+        problems.append("app.js 读不到")
+    else:
+        for api in V23_APIS:
+            if api not in app_src:
+                problems.append("app.js 里没有 %s" % api)
+        for fn in ("renderDepthDataURL", "renderPoseDataURL"):
+            if fn not in app_src:
+                problems.append("app.js 没调用 %s" % fn)
+        if "template_vars" not in app_src:
+            problems.append("app.js 没把上传结果塞进 template_vars")
+
+    impl = {}
+    for path, src in rig_srcs:
+        if not src:
+            continue
+        for fn in ("renderDepthDataURL", "renderPoseDataURL"):
+            if re.search(r"\b" + fn + r"\s*\(", src):
+                impl.setdefault(fn, os.path.basename(path))
+    missing_impl = [fn for fn in ("renderDepthDataURL", "renderPoseDataURL") if fn not in impl]
+    if missing_impl:
+        problems.append("js/ 里没有实现：%s" % ", ".join(missing_impl))
+    if problems:
+        return bad(name, "；".join(problems))
+    return ok(name, "%d 个新接口 + 两个导出函数都在 app.js 里调到；实现：%s"
+              % (len(V23_APIS),
+                 ", ".join("%s@%s" % (k, v) for k, v in sorted(impl.items()))))
+
+
+
 def main():
     say("=" * 78)
     say("SDXL 相机工作台 · 前端静态契约检查")
@@ -483,6 +551,13 @@ def main():
     check_brackets(js_files)
     if any(os.path.isfile(p) for p in js_files):
         check_three_imports(js_files)
+
+    # v2.3：新控件 / 新接口 / 离屏导出
+    app_src = read_text(APP_JS) if os.path.isfile(APP_JS) else ""
+    if html:
+        check_v23_dom(html, text or "", app_src)
+    check_v23_wiring(app_src, [(RIG_JS, read_text(RIG_JS) if os.path.isfile(RIG_JS) else ""),
+                               (CAMSHARED, read_text(CAMSHARED) if os.path.isfile(CAMSHARED) else "")])
 
     say("")
     say("=" * 78)

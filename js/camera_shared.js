@@ -703,10 +703,16 @@ export function computeCamera(posX, posY, posZ, roll, opts) {
 
   const posAll = posTokens.filter(Boolean);
   if (extraPos) posAll.push(extraPos);
-  const positive = posAll.join(", ");
+  let positive = posAll.join(", ");
   const negAll = negTokens.slice();
   if (extraNeg) negAll.push(extraNeg);
   const negative = negAll.join(", ");
+
+  // 8b. 可选拼接：subject_prompt → 相机段 → scene_prompt（都为空的旧行为不变）
+  const subjectPrompt = String(o.subject_prompt == null ? "" : o.subject_prompt).trim();
+  const scenePrompt = String(o.scene_prompt == null ? "" : o.scene_prompt).trim();
+  const assembly = assemblePrompt(subjectPrompt, positive, scenePrompt);
+  positive = assembly.positive;
 
   let fanRatio = 0.0;
   azimuthBins(px).forEach(([key, ratio]) => {
@@ -736,6 +742,18 @@ export function computeCamera(posX, posY, posZ, roll, opts) {
     rel_yaw: r3(rel),
     pan: [r3(panX), r3(panY)],
     tokens: budgetOf(positive, negative),
+    camera_start: assembly.camera_start,
+    camera_end: assembly.camera_end,
+    assembly: {
+      order: assembly.order,
+      camera_start: assembly.camera_start,
+      camera_end: assembly.camera_end,
+      total: assembly.total,
+      overflow: assembly.overflow,
+      overflow_by: assembly.overflow_by,
+      hint: assembly.hint,
+      segments: assembly.segments,
+    },
     preset: String(o.preset || "自定义"),
     strength: r3(strength),
     weight_mode: curve,
@@ -811,6 +829,47 @@ export function budgetOf(positive, negative) {
   };
 }
 
+// ══════════════════════ 可选拼接（黄金顺序） ══════════════════════
+// subject_prompt → 相机段 → scene_prompt（镜像 camera_core.py 的 ASSEMBLY_ORDER）
+export const ASSEMBLY_ORDER = ["subject", "camera", "scene"];
+
+/** 按 subject → camera → scene 拼正向提示词，并给出相机段 token 起止（镜像 assemble_prompt）。 */
+export function assemblePrompt(subjectPrompt, cameraPrompt, scenePrompt) {
+  const texts = { subject: subjectPrompt, camera: cameraPrompt, scene: scenePrompt };
+  const bodies = [];
+  const segments = {};
+  let cursor = 0;
+  ASSEMBLY_ORDER.forEach(name => {
+    const body = String(texts[name] == null ? "" : texts[name]).trim();
+    if (body) bodies.push(body);
+    const n = body ? clipTokens(body) : 0;
+    segments[name] = { text: body, start: cursor, end: cursor + n, tokens: n };
+    cursor += n;
+  });
+  const positive = bodies.join(", ");
+  const total = positive ? clipTokens(positive) : 0;
+  const cam = segments.camera;
+  const overflowBy = Math.max(0, total - CLIP_TOK_LIMIT);
+  let hint = "";
+  if (overflowBy) {
+    hint = "正向 " + total + " token 超过 Chunk 0 上限 " + CLIP_TOK_LIMIT +
+      "，相机段位于 " + cam.start + "-" + cam.end + "；尾部 " + overflowBy + " 个 token 会被截断";
+  } else if (total > CLIP_TOK_WARN) {
+    hint = "正向 " + total + " token 已过 " + CLIP_TOK_WARN + " 警戒线，相机段位于 " + cam.start + "-" + cam.end;
+  }
+  return {
+    positive: positive,
+    order: ASSEMBLY_ORDER.slice(),
+    segments: segments,
+    camera_start: cam.start,
+    camera_end: cam.end,
+    total: total,
+    overflow: !!overflowBy,
+    overflow_by: overflowBy,
+    hint: hint,
+  };
+}
+
 export const SDXL_TAGS = V;
 export { V, NEG };   // 供 js/sdxl_camera_widget.js 与标签面板直接引用
 
@@ -818,4 +877,5 @@ export default {
   V: V, NEG: NEG, PRESETS: PRESETS, PRESET_NAMES: PRESET_NAMES,
   computeCamera: computeCamera, sdxlWeight: sdxlWeight, focalToFov: focalToFov,
   clipTokens: clipTokens, budgetOf: budgetOf,
+  assemblePrompt: assemblePrompt, ASSEMBLY_ORDER: ASSEMBLY_ORDER,
 };

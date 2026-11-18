@@ -311,3 +311,28 @@ const rig = new CameraRig(canvas, { compact: false, interactive: true,
 批量队列 `POST /api/batch` 用同一份 base 参数与同一 seed 依次提交多个机位（三视图 / 环绕 8 机位 / 推拉 / 俯仰），
 `GET /api/batch?batch_id=` 聚合每张的 state/progress/images，Studio 用网格并排对比；ComfyUI 离线时整单 503，不会半提交。
 
+### 10.4 可选拼接端口 subject_prompt / scene_prompt（v2.4）
+
+节点 `CameraAngleSDXL` 的 `OPTIONAL` 输入新增两个字符串（默认 `""`，老工作流不填即与 v2.3 逐字相同）：
+
+| 输入 | 默认 | 语义 |
+|---|---|---|
+| `subject_prompt` | `""` | 主体词（人物 / 服装 / 动作），拼在相机段**前面** |
+| `scene_prompt` | `""` | 环境词（场景 / 光线 / 氛围），拼在相机段**后面** |
+
+拼接顺序是固定的「黄金顺序」`ASSEMBLY_ORDER = ("subject", "camera", "scene")`，实现为
+`core/camera_core.py` 的 `assemble_prompt(subject_prompt, camera_prompt, scene_prompt)`，
+`compute_camera` 在算完相机段后调用它（`opts["subject_prompt"] / opts["scene_prompt"]`）。
+空段直接跳过、不产生多余逗号；三段全空时 `positive` 为空串。
+
+`camera_info` 随之新增三个字段：
+
+| 字段 | 含义 |
+|---|---|
+| `camera_start` / `camera_end` | 相机段在最终 `positive` 里的 CLIP token 起止（左闭右开）；只填相机词时 `camera_start = 0`，`camera_end = clip_tokens(positive)` |
+| `assembly` | `{order, camera_start, camera_end, total, overflow, overflow_by, hint, segments{subject|camera|scene: {start, end, tokens}}}` |
+
+`overflow` 在 total 超过 `CLIP_TOK_LIMIT = 75` 时为真，`hint` 给出「相机制段位于 a-b、尾部 k 个 token 会被截断」这类中文提示；
+65 < total ≤ 75 走警戒提示，不截断。前端可直接把 `assembly.segments.camera` 画成 token 条上的高亮段。
+`js/camera_shared.js` 导出同名 `ASSEMBLY_ORDER` / `assemblePrompt()`，`tools/parity_check.py` 逐字比对。
+

@@ -21,3 +21,6 @@ desktop.ini
 
 # 已下线的发布脚本（内容已归档到 archive/）
 /发布到GitHub.bat
+
+# 归档目录只留在本地，不随公开仓库分发
+archive/

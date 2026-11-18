@@ -64,7 +64,14 @@ class CameraAngleSDXL:
                                               "tooltip": "附加负向提示词，原样追加"}),
                 "_cfg_json": ("STRING", {"default": "{}", "multiline": False,
                                          "tooltip": '词表覆盖 JSON，如 {"tags": {"front": "frontal view"}}'}),
-            }
+            },
+            # 可选端口（SPEC 10.4）：留空 = 老行为，输出与之前逐字相同
+            "optional": {
+                "subject_prompt": ("STRING", {"default": "", "multiline": True,
+                                               "tooltip": "主体词（人物/服装/动作），拼在相机段前面；留空则只要相机词"}),
+                "scene_prompt": ("STRING", {"default": "", "multiline": True,
+                                             "tooltip": "环境词（场景/光线/氛围），拼在相机段后面"}),
+            },
         }
 
     RETURN_TYPES = ("STRING", "STRING", "STRING")
@@ -76,7 +83,8 @@ class CameraAngleSDXL:
                 focal=50.0, pan_x=0.0, pan_y=0.0, subject_yaw=0.0, gaze_mode="auto",
                 preset="自定义", strength=1.0, weight_mode="tanh",
                 azimuth_mode="8bin", elevation_mode="3bin", neg_strength=1.0,
-                extra_positive="", extra_negative="", _cfg_json="{}"):
+                extra_positive="", extra_negative="", _cfg_json="{}",
+                subject_prompt="", scene_prompt=""):
         cfg = {}
         try:
             parsed = json.loads(_cfg_json) if _cfg_json and _cfg_json.strip() else {}
@@ -108,6 +116,7 @@ class CameraAngleSDXL:
             azimuth_mode=azimuth_mode, elevation_mode=elevation_mode,
             neg_strength=neg_strength, extra_positive=extra_positive,
             extra_negative=extra_negative, cfg=cfg,
+            subject_prompt=subject_prompt, scene_prompt=scene_prompt,
         )
         info = json.dumps(out["camera_info"], ensure_ascii=False)
         return (out["positive"], out["negative"], info)

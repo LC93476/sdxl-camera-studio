@@ -50,7 +50,9 @@
       "neg_strength": 1,
       "extra_positive": "",
       "extra_negative": "",
-      "_cfg_json": "{}"
+      "_cfg_json": "{}",
+      "subject_prompt": "",
+      "scene_prompt": ""
     }
   },
   "4": {

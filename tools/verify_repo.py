@@ -9,7 +9,7 @@
    - 用 git ls-files 列出被跟踪文件，校验关键文件一个不少；
    - 图片只允许 docs/screenshots/mapping.png、docs/screenshots/ui_overview.png、studio/icon.png、studio/icon.ico；
    - 确认 .gitignore 真的拦住了运行产物与本机配置；
-   - 确认已下线的发布脚本没有回来（内容在 archive/）。
+   - 确认已下线的发布脚本没有回来，且 archive/ 只留在本地、没进 git 索引。
 2. 远端模式（环境变量里有 GH_TOKEN）
    - 校验仓库是 private、默认分支、文件树里有全部关键文件、图片白名单一致；
    - 打印最近 5 条提交与两个关键文件的 raw 大小，顺带确认已删除的旧图确实 404。
@@ -41,6 +41,7 @@ KEY_FILES = [
     "studio/web/styles.css",
     "studio/web/app.js",
     "studio/web/camera3d.js",
+    "studio/web/_rig_export.html",
     "js/three.module.js",
     "studio/tools/e2e_test.py",
     "studio/tools/check_ui.py",
@@ -68,17 +69,12 @@ REMOVED_FILES = [
     "tools/tok_measure.py",
     "发布到GitHub.bat",
 ]
-ARCHIVE_FILES = [
-    "archive/说明.md",
-    "archive/publish_github.py",
-    "archive/publish_final.py",
-    "archive/recreate_public.py",
-    "archive/tok_measure.py",
-    "archive/发布到GitHub.bat",
-]
+# archive/ 只留在本地：不进 git 索引、不随发布分发。这里只记一条目录存在性提示。
+ARCHIVE_DIR = "archive"
 
 MUST_BE_IGNORED = [
     "studio/state/config.json",
+    "archive/",
     "studio/state/presets.json",
     "studio/out/",
     "out/",
@@ -217,17 +213,23 @@ def check_local(rep):
                 rep.warn("check-ignore 无法判断: " + rel)
 
     print("")
-    print("[4] 已下线的发布脚本不应回来")
+    print("[4] 已下线的发布脚本不应回来（archive/ 只留本地）")
     for f in REMOVED_FILES:
         if f in tset or os.path.exists(os.path.join(ROOT, f.replace("/", os.sep))):
             rep.fail("应已删除但仍存在: " + f)
         else:
             rep.pass_("已删除: " + f)
-    for f in ARCHIVE_FILES:
-        if os.path.exists(os.path.join(ROOT, f.replace("/", os.sep))):
-            rep.pass_("archive 里保留了原件: " + f)
-        else:
-            rep.fail("archive 缺少归档: " + f)
+    rc, out = git("ls-files", ARCHIVE_DIR)
+    if rc is None or rc != 0:
+        rep.warn("git 不可用，无法确认 archive/ 是否进了索引")
+    elif out.strip():
+        rep.fail("archive/ 还在 git 索引里，应从索引移除: " + out.strip().splitlines()[0] + " …")
+    else:
+        rep.pass_("archive/ 未进 git 索引（只留在本地）")
+    if os.path.isdir(os.path.join(ROOT, ARCHIVE_DIR)):
+        rep.pass_("本地 archive/ 仍在，需要时可查归档脚本")
+    else:
+        rep.warn("本地 archive/ 不存在（不影响发布）")
 
 
 def http_json(path, token):
@@ -303,6 +305,12 @@ def check_remote(rep, token):
     for f in REMOVED_FILES:
         if f in paths:
             rep.fail("远端还有已下线的文件: " + f)
+    leaked = [p for p in paths if p.startswith(ARCHIVE_DIR + "/")]
+    if leaked:
+        for p in sorted(leaked):
+            rep.fail("远端不该有归档目录内容: " + p)
+    else:
+        rep.pass_("远端没有 archive/（只留本地）")
     return True
 
 

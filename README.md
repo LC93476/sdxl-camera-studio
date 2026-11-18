@@ -108,6 +108,8 @@ python sdxl_camera_angle/tests/test_core.py     # 纯 assert 自测
 | `neg_strength` | FLOAT 0..2 / 0.05 | 1.0 | 负向强度，**0 = 完全关闭负向**（输出空串） |
 | `extra_positive` | STRING 多行 | "" | 原样追加到正向末尾 |
 | `extra_negative` | STRING 多行 | "" | 原样追加到负向末尾 |
+| `subject_prompt` | STRING 多行（**optional**） | "" | 主体词，拼在相机段**前面**（黄金顺序 subject → camera → scene） |
+| `scene_prompt` | STRING 多行（**optional**） | "" | 环境词，拼在相机段**后面**；两段留空即与旧版逐字相同 |
 | `_cfg_json` | STRING | `{}` | 词表/参数覆盖（深合并），见下 |
 
 输出：`positive` STRING、`negative` STRING、`camera_info` STRING(JSON)。
@@ -123,6 +125,12 @@ python sdxl_camera_angle/tests/test_core.py     # 纯 assert 自测
  "framing": [], "subject": "subject_front", "gaze": "gaze_viewer",
  "subject_yaw": 0.0, "rel_yaw": 0.0, "pan": [0.0, 0.0],
  "tokens": {"positive": 44, "negative": 0, "total": 44, "limit": 75, "warn": 65, "level": "ok"},
+ "camera_start": 0, "camera_end": 44,
+ "assembly": {"order": ["subject", "camera", "scene"], "camera_start": 0, "camera_end": 44,
+              "total": 44, "overflow": false, "overflow_by": 0, "hint": "",
+              "segments": {"subject": {"start": 0, "end": 0, "tokens": 0},
+                           "camera": {"start": 0, "end": 44, "tokens": 44},
+                           "scene": {"start": 44, "end": 44, "tokens": 0}}},
  "preset": "自定义", "strength": 1.0, "weight_mode": "tanh",
  "azimuth_mode": "8bin", "elevation_mode": "3bin", "neg_strength": 0.0,
  "parts": [{"kind": "az", "key": "front", "ratio": 1.0, "raw": 10.0, "weight": 1.4,
@@ -226,7 +234,9 @@ SDXL 的两个文本编码器（CLIP-L 与 OpenCLIP-bigG）都是 **75 token/块
 - 本节点默认词表很紧凑：front 11 / front_right 7 / right 8 / back 9 / high 6 / eye 3 / low 9 /
   bird 10 / worm 9 / ecu 7 / cu 6 / medium 5 / cowboy 7 / full 3 / wide 10 / dutch 10 token。
   方位 1 条 + 高度 1 条 + 距离 1 条通常 15~30 token。
-- **排布建议**：质量前缀 → 主体描述 → **相机段** → 场景/光照。用 `extra_positive` 追加的内容排在相机段
+- **排布建议**：质量前缀 → 主体描述 → **相机段** → 场景/光照。最省事的是用 optional 的 `subject_prompt` / `scene_prompt`：
+  按「主体 → 相机 → 场景」自动拼好，`camera_info.camera_start/camera_end` 直接告诉你相机段落在第几到第几个 token，
+  超 75 时 `assembly.hint` 会点名截断位置。手排则用 `extra_positive`，它追加的内容排在相机段
   **之后**，所以场景词放这里是安全的；前缀长度建议控制在 ~50 token 以内。
 - 前缀 72 + 相机 53 = 125 token 就会切成 2 块，相机掉到第 1 块 → 出图失去角度控制。这是 SDXL 相机
   控制最常见的翻车点，不是权重问题。

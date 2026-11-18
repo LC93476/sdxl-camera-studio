@@ -321,6 +321,51 @@ def test_token_budget():
           % (tb["total"], tb["level"]))
 
 
+# ══════════ 8c. 可选拼接（subject → camera → scene） ══════════
+def test_assembly_prompt():
+    from camera_core import assemble_prompt, ASSEMBLY_ORDER
+    assert ASSEMBLY_ORDER == ("subject", "camera", "scene"), ASSEMBLY_ORDER
+    assert assemble_prompt("", "", "")["positive"] == ""
+
+    subject, scene = "1girl, silver hair", "city street at night"
+    out = pos(0.0, 0.0, 0.0, subject_prompt=subject, scene_prompt=scene)
+    ci = out["camera_info"]
+    plain = out["positive"]
+    assert plain.startswith(subject + ","), plain[:60]
+    assert plain.endswith(scene), plain[-40:]
+    assert "(front view:1.40)" in plain
+    asm = ci["assembly"]
+    assert asm["order"] == ["subject", "camera", "scene"], asm["order"]
+    assert asm["segments"]["subject"]["tokens"] == clip_tokens(subject)
+    assert ci["camera_start"] == asm["segments"]["subject"]["end"]
+    assert ci["camera_end"] == ci["camera_start"] + asm["segments"]["camera"]["tokens"]
+    assert ci["camera_end"] <= asm["total"]
+
+    legacy = pos(0.0, 0.0, 0.0)
+    assert legacy["camera_info"]["camera_start"] == 0
+    assert legacy["camera_info"]["camera_end"] == clip_tokens(legacy["positive"])
+    assert "assembly" in legacy["camera_info"]
+
+    only_s = pos(0.0, 0.0, 0.0, subject_prompt=subject)
+    assert only_s["positive"].startswith(subject + ",")
+    assert only_s["camera_info"]["camera_start"] == clip_tokens(subject)
+    only_c = pos(0.0, 0.0, 0.0, scene_prompt=scene)
+    assert only_c["positive"].endswith(scene)
+    assert only_c["camera_info"]["camera_start"] == 0
+
+    huge = ", ".join(["subject placed on the left third"] * 12)
+    over = pos(0.0, 0.0, 0.0, subject_prompt=huge)
+    oa = over["camera_info"]["assembly"]
+    assert oa["overflow"] is True, oa
+    assert oa["overflow_by"] == oa["total"] - CLIP_TOK_LIMIT, oa
+    assert "截断" in oa["hint"], oa["hint"]
+    assert over["camera_info"]["tokens"]["level"] == "danger"
+    ok_asm = pos(0.0, 0.0, 0.0, subject_prompt="1girl")["camera_info"]["assembly"]
+    assert ok_asm["overflow"] is False and "截断" not in ok_asm["hint"]
+    print("[ok] 拼接: subject→camera→scene，相机段 %d-%d，超 %d 时给截断提示"
+          % (ci["camera_start"], ci["camera_end"], CLIP_TOK_LIMIT))
+
+
 def test_world_yaw_geometry():
     # 相对角 = wrap(yaw - pos_x)：同一 yaw 在不同机位下结论不同
     assert rel_yaw(0.0, 0.0) == 0.0
@@ -543,6 +588,7 @@ def main():
         test_framing,
         test_subject_gaze,
         test_token_budget,
+        test_assembly_prompt,
         test_world_yaw_geometry,
         test_pole_conflicts,
         test_negative,

@@ -622,6 +622,12 @@ def compute_camera(pos_x=0.0, pos_y=0.0, pos_z=0.0, roll=0.0, **opts):
     positive = ", ".join([t for t in pos_tokens if t] + ([extra_pos] if extra_pos else []))
     negative = ", ".join(neg_tokens + ([extra_neg] if extra_neg else []))
 
+    # ── 8b. 可选拼接：subject_prompt → 相机段 → scene_prompt（都为空的旧行为不变）──
+    subject_prompt = str(opts.get("subject_prompt") or "").strip()
+    scene_prompt = str(opts.get("scene_prompt") or "").strip()
+    assembly = assemble_prompt(subject_prompt, positive, scene_prompt)
+    positive = assembly["positive"]
+
     fan_ratio = 0.0
     for key, ratio in azimuth_bins(px):
         if key in ("back", "back_left", "back_right"):
@@ -650,6 +656,21 @@ def compute_camera(pos_x=0.0, pos_y=0.0, pos_z=0.0, roll=0.0, **opts):
         "rel_yaw": round(rel, 3),
         "pan": [round(pan_x, 3), round(pan_y, 3)],
         "tokens": token_budget(positive, negative),
+        "camera_start": assembly["camera_start"],
+        "camera_end": assembly["camera_end"],
+        "assembly": {
+            "order": assembly["order"],
+            "camera_start": assembly["camera_start"],
+            "camera_end": assembly["camera_end"],
+            "total": assembly["total"],
+            "overflow": assembly["overflow"],
+            "overflow_by": assembly["overflow_by"],
+            "hint": assembly["hint"],
+            "segments": {
+                k: {"start": v["start"], "end": v["end"], "tokens": v["tokens"]}
+                for k, v in assembly["segments"].items()
+            },
+        },
         "preset": str(opts.get("preset") or "自定义"),
         "strength": round(strength, 3),
         "weight_mode": curve,
@@ -748,3 +769,52 @@ def token_budget(positive, negative=""):
         level = "ok"
     return {"positive": p, "negative": n, "total": total,
             "limit": CLIP_TOK_LIMIT, "warn": CLIP_TOK_WARN, "level": level}
+
+
+# ══════════════════════ 可选拼接（黄金顺序） ══════════════════════
+# subject_prompt → 相机段 → scene_prompt：主体词吃最靠前的强权重，机位词居中，环境词殿后。
+ASSEMBLY_ORDER = ("subject", "camera", "scene")
+
+
+def assemble_prompt(subject_prompt="", camera_prompt="", scene_prompt=""):
+    """按 subject → camera → scene 拼正向提示词，并给出相机段的 token 起止位置。
+
+    返回 dict：positive / order / segments / camera_start / camera_end / total /
+    overflow / overflow_by / hint。三段都为空时 positive 为空串、相机段 0-0。
+    只做拼接与计数，不改编相机词本身的权重，所以旧行为（两段都空）逐字不变。
+    """
+    texts = {"subject": subject_prompt, "camera": camera_prompt, "scene": scene_prompt}
+    bodies = []
+    segments = {}
+    cursor = 0
+    for name in ASSEMBLY_ORDER:
+        body = str(texts.get(name) or "").strip()
+        if body:
+            bodies.append(body)
+        n = clip_tokens(body) if body else 0
+        segments[name] = {"text": body, "start": cursor, "end": cursor + n, "tokens": n}
+        cursor += n
+    positive = ", ".join(bodies)
+    total = clip_tokens(positive) if positive else 0
+    cam = segments["camera"]
+    overflow_by = max(0, total - CLIP_TOK_LIMIT)
+    if overflow_by:
+        hint = ("正向 %d token 超过 Chunk 0 上限 %d，相机段位于 %d-%d；"
+                "尾部 %d 个 token 会被截断") % (total, CLIP_TOK_LIMIT,
+                                                cam["start"], cam["end"], overflow_by)
+    elif total > CLIP_TOK_WARN:
+        hint = "正向 %d token 已过 %d 警戒线，相机段位于 %d-%d" % (
+            total, CLIP_TOK_WARN, cam["start"], cam["end"])
+    else:
+        hint = ""
+    return {
+        "positive": positive,
+        "order": list(ASSEMBLY_ORDER),
+        "segments": segments,
+        "camera_start": cam["start"],
+        "camera_end": cam["end"],
+        "total": total,
+        "overflow": bool(overflow_by),
+        "overflow_by": overflow_by,
+        "hint": hint,
+    }

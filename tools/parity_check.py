@@ -136,6 +136,21 @@ def check_v2(src):
     print("[v2] CLIP token 预算 %d/%d + clipTokens/budgetOf"
           % (int(c.CLIP_TOK_WARN), int(c.CLIP_TOK_LIMIT)))
 
+    # 4d) 可选拼接（黄金顺序）：顺序常量两边一致 + 两个实现都在
+    py_order = list(getattr(c, "ASSEMBLY_ORDER", ()))
+    m = re.search(r"export const ASSEMBLY_ORDER\s*=\s*\[(.*?)\]", src, re.S)
+    js_order = re.findall(r'"([^"]+)"', m.group(1)) if m else []
+    if not py_order or py_order != js_order:
+        print("ASSEMBLY_ORDER 差异 py:", py_order, "js:", js_order)
+        bad += 1
+    if not hasattr(c, "assemble_prompt"):
+        print("core 缺 assemble_prompt")
+        bad += 1
+    if "export function assemblePrompt" not in src:
+        print("js/camera_shared.js 缺 export function assemblePrompt")
+        bad += 1
+    print("[v2] 拼接顺序 %s + assemble_prompt/assemblePrompt" % "→".join(py_order))
+
     # 5) 预设附加参数与模式
     from presets import PRESET_EXTRAS, PRESET_MODES
     for label, pyv in (("PRESET_EXTRAS", PRESET_EXTRAS), ("PRESET_MODES", PRESET_MODES)):

@@ -12,7 +12,9 @@
     1. 在 8800-8899 里挑空闲端口，Popen([PY, 'studio/server.py', '--port', P, '--no-browser'])；
     2. 轮询 /api/health 直到 ok 或 25s 超时；
     3. 逐条跑契约 API，打印 PASS/FAIL 与关键字段；
-    4. ComfyUI(127.0.0.1:8188) 在线时做一次真实出图：640x640 / steps=12，轮询到 done，校验 PNG；
+    4. v2.3 新端点：/api/templates/inspect（含 UI 工程文件必须 ok:false）、
+       /api/controlnet/upload（1x1 PNG data URL + 本地副本校验）、/api/batch（离线整单 503）；
+    5. ComfyUI(127.0.0.1:8188) 在线时做一次真实出图：640x640 / steps=12，轮询到 done，校验 PNG；
     5. 汇总 PASS/FAIL/SKIP，FAIL>0 退出码 1。
 
 退出码：0 全绿；1 有 FAIL；3 server.py 不在（队友还没写完）。
@@ -20,6 +22,8 @@
 from __future__ import print_function
 
 import argparse
+import base64
+import hashlib
 import json
 import os
 import random
@@ -44,6 +48,7 @@ APP_DIR = os.path.dirname(STUDIO_DIR)
 SERVER_PY = os.path.join(STUDIO_DIR, "server.py")
 WEB_DIR = os.path.join(STUDIO_DIR, "web")
 OUT_DIR = os.path.join(STUDIO_DIR, "out")
+STATE_DIR = os.path.join(STUDIO_DIR, "state")
 PY = r"D:\QUARK\ComfyUI-aki-v3.2\python\python.exe"
 COMFY = "http://127.0.0.1:8188"
 CKPT_DIR = r"D:\QUARK\ComfyUI-aki-v3.2\ComfyUI\models\checkpoints"
@@ -550,6 +555,195 @@ def check_traversal():
     return bad(name, "返回码 %s（要求 400 或 403）：%s" % (codes, got))
 
 
+# ------------------------------------------------- v2.3 新端点 ---
+PNG_1X1_B64 = ("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA"
+               "60e6kgAAAABJRU5ErkJggg==")   # 1x1 透明 PNG，67 字节
+
+
+def check_templates_inspect():
+    name = "POST /api/templates/inspect"
+    problems = []
+    notes = []
+
+    code, raw, _ = http("POST", "/api/templates/inspect", {"ref": "SDXL.CameraAngle.ControlNet"})
+    d = as_json(raw) or {}
+    if code != 200:
+        problems.append("ControlNet 模板 → HTTP %s body=%s" % (code, head(raw, 140)))
+    elif not d.get("ok"):
+        problems.append("ControlNet 模板 ok=false：%s" % head(d.get("error") or d.get("warn"), 140))
+    else:
+        sn = d.get("sniff") or {}
+        cn = sn.get("controlnet") or {}
+        pos = [x.get("node") for x in (sn.get("positive") or [])]
+        neg = [x.get("node") for x in (sn.get("negative") or [])]
+        depth = [x.get("node") for x in (cn.get("depth") or [])]
+        pose = [x.get("node") for x in (cn.get("pose") or [])]
+        if int(d.get("nodes") or 0) != 13:
+            problems.append("nodes=%r（期望 13）" % d.get("nodes"))
+        if pos != ["3"]:
+            problems.append("正向槽位=%r（期望 ['3']）" % (pos,))
+        if neg != ["4"]:
+            problems.append("负向槽位=%r（期望 ['4']）" % (neg,))
+        if depth != ["10"]:
+            problems.append("depth 槽位=%r（期望 ['10']）" % (depth,))
+        if pose != ["13"]:
+            problems.append("pose 槽位=%r（期望 ['13']）" % (pose,))
+        if not str(d.get("template_path") or "").endswith(".json"):
+            problems.append("template_path=%r" % (d.get("template_path"),))
+        if sn.get("sampler") != "6" or sn.get("latent") != "5" or sn.get("save") != "8":
+            problems.append("sampler/latent/save=%r/%r/%r（期望 6/5/8）"
+                            % (sn.get("sampler"), sn.get("latent"), sn.get("save")))
+        notes.append("ControlNet 模板 nodes=%s pos=%s neg=%s sampler=%s depth=%s pose=%s"
+                     % (d.get("nodes"), pos, neg, sn.get("sampler"), depth, pose))
+
+    code2, raw2, _ = http("POST", "/api/templates/inspect", {"ref": "SDXL.CameraAngle.api"})
+    d2 = as_json(raw2) or {}
+    if code2 != 200 or not d2.get("ok"):
+        problems.append("api 模板 → HTTP %s ok=%r %s"
+                        % (code2, d2.get("ok"), head(d2.get("error") or raw2, 120)))
+    else:
+        sn2 = d2.get("sniff") or {}
+        camera = sn2.get("camera") or []
+        pos2 = [x.get("node") for x in (sn2.get("positive") or [])]
+        neg2 = [x.get("node") for x in (sn2.get("negative") or [])]
+        if "3" not in camera:
+            problems.append("api 模板没识别 CameraAngleSDXL（camera=%r）" % (camera,))
+        if pos2 != ["4"] or neg2 != ["5"]:
+            problems.append("api 模板正负槽位=%r/%r（期望 ['4']/['5']）" % (pos2, neg2))
+        notes.append("api 模板 nodes=%s camera=%s pos=%s neg=%s"
+                     % (d2.get("nodes"), camera, pos2, neg2))
+
+    code3, raw3, _ = http("POST", "/api/templates/inspect", {"ref": "SDXL.CameraAngle"})
+    d3 = as_json(raw3) or {}
+    if code3 != 200:
+        problems.append("UI 工程文件 → HTTP %s（契约要求 200 + ok:false）" % code3)
+    elif d3.get("ok"):
+        problems.append("UI 工程文件被当成合法模板（ok=true）")
+    elif "Export (API)" not in str(d3.get("error") or ""):
+        problems.append("UI 工程文件 error 文案不含 Export (API)：%s" % head(d3.get("error"), 100))
+
+    code4, raw4, _ = http("POST", "/api/templates/inspect", {"ref": ""})
+    if code4 != 400:
+        problems.append("空 ref → HTTP %s（期望 400）body=%s" % (code4, head(raw4, 100)))
+
+    if problems:
+        return bad(name, "；".join(problems))
+    return ok(name, "%s；UI 工程文件 200+ok:false 且提到 Export (API)；空 ref 400"
+              % "；".join(notes))
+
+
+def check_controlnet_upload():
+    name = "POST /api/controlnet/upload（1x1 PNG data URL）"
+    data_url = "data:image/png;base64," + PNG_1X1_B64
+    blob = base64.b64decode(PNG_1X1_B64)
+    sha = hashlib.sha1(blob).hexdigest()
+    problems = []
+    note = ""
+
+    code, raw, _ = http("POST", "/api/controlnet/upload", {"kind": "depth", "data_url": data_url})
+    d = as_json(raw) or {}
+    fn = str(d.get("filename") or "")
+    if code not in (200, 503):
+        problems.append("depth 上传 → HTTP %s body=%s" % (code, head(raw, 140)))
+    else:
+        if not fn.startswith("cn_depth_") or not fn.endswith(".png"):
+            problems.append("filename=%r（期望 cn_depth_*.png）" % (fn,))
+        if d.get("bytes") != len(blob):
+            problems.append("bytes=%r（期望 %d）" % (d.get("bytes"), len(blob)))
+        if str(d.get("sha1") or "") != sha:
+            problems.append("sha1=%r（期望 %s…）" % (d.get("sha1"), sha[:12]))
+        if code == 503 and d.get("ok") is not False:
+            problems.append("503 时 ok 应为 false（实际 %r）" % (d.get("ok"),))
+        local = os.path.join(STATE_DIR, "controlnet", fn) if fn else ""
+        if local and not os.path.isfile(local):
+            problems.append("本地副本没落盘：%s" % local)
+        elif local:
+            with open(local, "rb") as fh:
+                disk = fh.read()
+            if disk != blob:
+                problems.append("本地副本内容不一致：%s（%d 字节）" % (local, len(disk)))
+            else:
+                note = ("HTTP %s（%s）filename=%s %d B sha1=%s 本地副本一致：%s"
+                        % (code, "ComfyUI 在线" if code == 200 else "离线仅落本地副本",
+                           fn, len(blob), sha[:12], local))
+
+    code2, raw2, _ = http("POST", "/api/controlnet/upload", {"kind": "normal", "data_url": data_url})
+    if code2 != 400:
+        problems.append("kind=normal → HTTP %s（期望 400）" % code2)
+    code3, raw3, _ = http("POST", "/api/controlnet/upload",
+                          {"kind": "depth", "data_url": "data:image/jpeg;base64,AAAA"})
+    if code3 != 400:
+        problems.append("非 PNG data URL → HTTP %s（期望 400）" % code3)
+
+    if problems:
+        return bad(name, "；".join(problems))
+    return ok(name, note + "；kind / data_url 非法各回 400")
+
+
+SKIP_SUBMIT = False  # --no-generate 时置 True：批量用例只验参数与查询，不真提交（省 GPU）
+
+
+def check_batch():
+    name = "POST /api/batch（批量提交）"
+    models = META.get("_models") or {}
+    ckpt, src = pick_checkpoint(models)
+    base = dict(CAMERA_DEFAULT)
+    if ckpt:
+        base["checkpoint"] = ckpt
+    else:
+        base["template"] = "SDXL.CameraAngle.ControlNet"
+    body = {
+        "name": "qa_batch", "base": base, "same_seed": True, "seed": 20251118,
+        "shots": [
+            {"label": "正面", "params": {"pos_x": 0.0, "pos_y": 0.0, "pos_z": 0.0}},
+            {"label": "右侧90", "params": {"pos_x": 0.5, "pos_y": 0.0, "pos_z": 0.0}},
+        ],
+    }
+    problems = []
+    note = "checkpoint=%s（来自 %s）" % (ckpt, src) if ckpt else "checkpoint 空，用模板 workflow_template"
+    d = {}
+    if SKIP_SUBMIT:
+        note += "；--no-generate 下不真提交（省 GPU）"
+    else:
+        code, raw, _ = http("POST", "/api/batch", body, timeout=90)
+        d = as_json(raw) or {}
+        if code not in (200, 503):
+            problems.append("POST /api/batch → HTTP %s body=%s" % (code, head(raw, 160)))
+        elif code == 503:
+            if d.get("ok") is not False:
+                problems.append("离线 503 时 ok 应为 false（实际 %r）" % (d.get("ok"),))
+            if d.get("jobs") != []:
+                problems.append("离线时必须整单不提交，jobs 应为空（实际 %r）" % (d.get("jobs"),))
+            if d.get("batch_id"):
+                problems.append("离线时不该生成 batch_id（%r）" % (d.get("batch_id"),))
+            note += "；HTTP 503 整单未提交（%s）" % head(d.get("error"), 60)
+        else:
+            jobs = d.get("jobs") or []
+            if len(jobs) != 2:
+                problems.append("在线 jobs 数量=%d（期望 2）" % len(jobs))
+            if not str(d.get("batch_id") or "").startswith("b"):
+                problems.append("batch_id=%r" % (d.get("batch_id"),))
+            for j in jobs:
+                for key in ("label", "prompt_id", "positive", "negative"):
+                    if not j.get(key):
+                        problems.append("job 缺 %s：%s" % (key, head(json.dumps(j, ensure_ascii=False), 100)))
+            note += "；HTTP 200 batch_id=%s seed=%s jobs=%d" % (d.get("batch_id"), d.get("seed"), len(jobs))
+
+    code2, raw2, _ = http("POST", "/api/batch", {"shots": []})
+    if code2 != 400:
+        problems.append("空 shots → HTTP %s（期望 400）" % code2)
+
+    code3, raw3, _ = http("GET", q("/api/batch", batch_id=d.get("batch_id") or ""))
+    d3 = as_json(raw3) or {}
+    if code3 != 200 or not d3.get("ok"):
+        problems.append("GET /api/batch → HTTP %s ok=%r %s"
+                        % (code3, d3.get("ok"), head(d3.get("error") or raw3, 120)))
+
+    if problems:
+        return bad(name, "；".join(problems))
+    return ok(name, note + "；空 shots 400；GET /api/batch 200")
+
+
 # ---------------------------------------------------------- 真实出图 ---
 def comfy_alive():
     for probe in ("/system_stats", "/queue", "/object_info"):
@@ -675,12 +869,13 @@ def check_generate():
 
 # ---------------------------------------------------------------- 主流程 ---
 def main():
-    global PORT, BASE
+    global PORT, BASE, SKIP_SUBMIT
     ap = argparse.ArgumentParser(description="SDXL 相机工作台端到端契约测试")
     ap.add_argument("--port", type=int, default=0)
     ap.add_argument("--no-generate", action="store_true")
     ap.add_argument("--keep-server", action="store_true")
     args = ap.parse_args()
+    SKIP_SUBMIT = bool(args.no_generate)
 
     say("=" * 78)
     say("SDXL 相机工作台 · e2e 契约测试")
@@ -728,6 +923,9 @@ def main():
         check_open_folder()
         check_static()
         check_traversal()
+        check_templates_inspect()
+        check_controlnet_upload()
+        check_batch()
         if args.no_generate:
             skip("真实出图", "--no-generate")
         else:

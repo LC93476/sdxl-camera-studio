@@ -155,7 +155,11 @@ canvas `#view3d`，球体 + 人偶参考，三个手柄：
 `bins`（**三元组** `[key, ratio, kind]`，kind ∈ az/el/di/lens/tg/frame/subject/gaze）、`elevation`、`distance`、
 `dutch`、`roll_deg`、`fov_deg`、`focal`、`lens`、`az_gate`、`pole_gate`、`azimuth_suppressed`、`behind_ratio`、
 `framing`、`subject`、`gaze`、`subject_yaw`、`pan`、`preset`、`strength`、`weight_mode`、`azimuth_mode`、
-`elevation_mode`、`neg_strength`、`parts`、`negative_parts`。`parts[]` 每项带 `kind/key/ratio/raw/weight/phrase/tokens`。
+`elevation_mode`、`neg_strength`、`parts`、`negative_parts`、`rel_yaw`、`tokens`。`parts[]` 每项带 `kind/key/ratio/raw/weight/phrase/tokens`。
+
+节点侧还可选填 `subject_prompt` / `scene_prompt`（v2.4）：按「主体 → 相机 → 场景」拼成一次输出，
+`camera_info` 多出 `camera_start` / `camera_end` 与 `assembly`（各段 token 起止 + 超 75 的截断提示）。
+工作台不传这两个口，机位词永远排最前，行为与之前一致。
 
 ## 5. 预设
 

@@ -58,7 +58,9 @@ n9001 = node(9001, "CameraAngleSDXL", [480, 80], [460, 760], [],
              [0.0, 0.0, 0.0, 0.0,        # pos_x / pos_y / pos_z / roll
               50.0, 0.0, 0.0, 0.0, "auto",  # focal / pan_x / pan_y / subject_yaw / gaze_mode
               "自定义", 1.0, "tanh", "8bin", "3bin", 1.0,
-              BASE_POS, BASE_NEG, "{}"], "SDXL 相机控制（拖 3D 手柄或调参数）")
+              BASE_POS, BASE_NEG, "{}",
+              "", ""],  # subject_prompt / scene_prompt（可选拼接端口）
+             "SDXL 相机控制（拖 3D 手柄或调参数）")
 # ---- 11/12 文本编码 ----
 n11 = node(11, "CLIPTextEncode", [980, 200], [420, 180],
            [{"name": "clip", "type": "CLIP", "link": None},

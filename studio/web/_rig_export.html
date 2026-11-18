@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><title>CameraRig 深度/骨架导出探针</title>
+<!--
+  开发探针：把 CameraRig 的 renderDepthDataURL / renderPoseDataURL 结果写进 <pre id=out>，
+  供无头浏览器抓取（--dump-dom）后做像素级验收，也用来给 ControlNet 喂图。
+  用法（工作台已在跑时）：
+    python studio/server.py --port 8813 --no-browser &
+    "/c/Program Files (x86)/Microsoft/Edge/Application/msedge.exe" --headless=new --disable-gpu \
+      --hide-scrollbars --virtual-time-budget=12000 --dump-dom \
+      http://127.0.0.1:8813/_rig_export.html > _rig_export_dom.html
+  机位改 URL 参数即可：?_rig_export.html?px=0.5&py=0.25&focal=85&yaw=0.35&w=512&h=768
+-->
+<style>body{margin:0;background:#111}canvas{display:block}pre{color:#0f0;font-size:9px}</style></head><body>
+<canvas id="c" width="512" height="768"></canvas><pre id="out"></pre>
+<script type="importmap">{"imports":{"three":"/js/three.module.js","/js/":"/js/"}}</script>
+<script type="module">
+import { CameraRig } from "/js/camera_rig.js";
+
+const q = new URLSearchParams(location.search);
+const num = (key, fallback) => {
+  const raw = q.get(key);
+  const v = raw === null ? NaN : Number(raw);
+  return Number.isFinite(v) ? v : fallback;
+};
+const W = Math.max(64, Math.round(num("w", 512)));
+const H = Math.max(64, Math.round(num("h", 768)));
+const canvas = document.getElementById("c");
+canvas.width = W;
+canvas.height = H;
+
+const state = {
+  pos_x: num("px", 0.5), pos_y: num("py", 0.25), pos_z: num("pz", 0.1),
+  roll: num("roll", 0.0), focal: num("focal", 50),
+  pan_x: num("panx", 0.0), pan_y: num("pany", 0.0),
+  subject_yaw: num("yaw", 0.35), gaze_mode: q.get("gaze") || "auto",
+};
+
+let out = { ok: false };
+try {
+  const rig = new CameraRig(canvas);
+  rig.setState(state);
+  const d = rig.renderDepthDataURL(W, H, { invert: q.get("invert") !== "0" });
+  const p = rig.renderPoseDataURL(W, H);
+  out = { ok: true, w: W, h: H, state, dlen: d.length, plen: p.length, d, p };
+  rig.dispose();
+} catch (e) {
+  out = { ok: false, err: String((e && e.stack) || e) };
+}
+document.getElementById("out").textContent = JSON.stringify(out);
+</script></body></html>
