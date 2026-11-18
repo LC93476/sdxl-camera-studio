@@ -143,7 +143,7 @@ def tracked_files():
 def walk_files():
     got = []
     for base, dirs, names in os.walk(ROOT):
-        dirs[:] = [d for d in dirs if d not in (".git", "__pycache__", "out", "node_modules")]
+        dirs[:] = [d for d in dirs if d not in (".git", "__pycache__", "out", "out_keep", "node_modules", ".venv", "state")]
         for n in names:
             p = os.path.join(base, n)
             got.append(os.path.relpath(p, ROOT).replace("\\", "/"))
