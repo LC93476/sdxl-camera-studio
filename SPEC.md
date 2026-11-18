@@ -173,3 +173,55 @@ D:/QUARK/sdxl_camera_angle/
 - `python -c "from camera_core import compute_camera; print(compute_camera(0,0,0,0))"` → front + eye + medium，权重全部在 [0.05,1.4]。
 - 方位扫描 pos_x ∈ {-1,-0.75,...,1} 时正/负向短语按 45° 正确切换，斜侧出现双档。
 - 同一 seed 下不同方位出图，方向必须肉眼可见地变（Lead 负责出图验证）。
+
+## 7. v2 扩展：光学 / 构图 / 主体朝向
+
+四个新维度全部在 core/camera_core.py 里映射，js/camera_shared.js 是镜像实现（parity_check 校验）。
+
+### 7.1 焦距 focal（等效 36mm 全画幅，mm）
+fov_deg = 2*atan(36/(2*focal)) * 180/pi。分档（左闭右开，超出取端档）：
+
+| focal | key | 原始权重 raw | tanh 后 |
+|---|---|---|---|
+| <=18 | lens14 | 5.0 | 1.30 |
+| <=29 | lens24 | 3.2 | 1.22 |
+| <=43 | lens35 | 1.8 | 1.11 |
+| <=65 | lens50 | 1.0 | 1.00（裸写） |
+| <=105 | lens85 | 4.0 | 1.26 |
+| >105 | lens135 | 5.0 | 1.30 |
+
+### 7.2 翻滚 roll in [-1,1]（±1 = ±45°）
+|roll| > 0.25 才出词：raw = 1 + 6*|roll|；正值 → dutch（顺时针倾斜），负值 → dutch_neg（反向倾斜）。
+camera_info.roll_deg = roll*45。
+
+### 7.3 构图偏移 pan_x / pan_y in [-1,1]（取景中心解耦）
+- pan_x > 0 = 相机右移 → 主体落到画面左侧三分线 → subject_left；< 0 → subject_right。
+- pan_y > 0 = 机位上抬 → 主体压到画面下方（上方留白）→ subject_low；< 0 → subject_high。
+- 两者 |v| < 0.12 → subject_center（裸写）。
+- 权重 raw = 1 + 2.0*|v|（slope 可 cfg 覆盖）。
+
+### 7.4 主体朝向 subject_yaw in [-1,1] + gaze_mode in {auto,camera,away}
+- |yaw| < 0.28 → subject_front（面向镜头）；<0.72 → subject_turn（三分之四背转）；>=0.72 → subject_away。
+- 视线：gaze_mode=camera → gaze_viewer；away → gaze_away；auto 时
+  subject_front → viewer；机位在背面（back 系 bins 权重和 > 0.45）且 |yaw| <= 0.72 → gaze_over_shoulder（回眸）；其余 → away。
+- 视线词裸写（权重 1.00），朝向词 raw = 1 + 2.0*|yaw|。
+
+## 8. v2 极点消歧
+
+POLE_START = 0.75、POLE_DEG = 75、POLE_NORM = 75/90 = 0.8333、AZ_SUPPRESS = 0.12。
+
+- pole_gate(y) = clamp((1-|y|)/(1-0.75), 0, 1)（0.75 处 1，1.0 处 0）。
+- 有效方位系数 gate = az_gate(y) * pole_gate(y)；gate < 0.12 时**整段方位词被丢弃**，
+  camera_info.azimuth_suppressed = true（|pos_y| 约 0.94 以上必触发）。
+- |pos_y| > 0.75 时按高度档位剔除方位/视线里的冲突 token（POLE_BLOCK_TOKENS）：
+  - bird: front view / straight-on shot / facing the camera / eye level shot / looking at viewer / direct eye contact
+  - worm: eye level shot / top-down view / looking down at viewer
+  - high / low: eye level shot
+- 结果：pos_y=1, elevation_mode=5bin 只出 from above, high angle, looking down at viewer, top-down view + 距离 + 光学 + 构图，
+  **不再出现 from behind**。
+
+## 9. v2 camera_info 增补字段
+
+focal, fov_deg, lens, roll_deg, pole_gate, azimuth_suppressed, behind_ratio, framing[], subject, gaze, subject_yaw, pan[2]；
+parts[] 每项 {kind, key, raw, weight, phrase, tokens[], note}，kind in {az, el, di, lens, tg, frame, subject, gaze}。
+

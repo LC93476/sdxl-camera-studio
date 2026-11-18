@@ -227,11 +227,11 @@ def check_meta():
     presets = d.get("presets")
     if not isinstance(presets, dict):
         return bad(name, "presets 不是 dict：%r" % type(presets))
-    if len(presets) != 11:
-        return bad(name, "内置预设 %d 个（应为 11）：%s" % (len(presets), list(presets.keys())))
+    if len(presets) != 16:
+        return bad(name, "内置预设 %d 个（应为 16）：%s" % (len(presets), list(presets.keys())))
     names = d.get("preset_names")
-    if not isinstance(names, list) or len(names) != 12:
-        return bad(name, "preset_names 应为 12 项（自定义+11）：%r" % (names,))
+    if not isinstance(names, list) or len(names) != 17:
+        return bad(name, "preset_names 应为 17 项（自定义+16）：%r" % (names,))
     lost = [p for p in presets if p not in names]
     if lost:
         return bad(name, "preset_names 缺 %s" % lost)
@@ -255,8 +255,8 @@ def check_meta():
         return bad(name, "weight_mode 枚举缺 %s" % bad_vals)
     if not isinstance(d.get("ui_presets"), dict):
         return bad(name, "ui_presets 不是 dict")
-    detail = ("11 预设 / names=%d / defaults=%d 键 / enums(weight_mode=%s,az=%s,el=%s) / vocab=%d 键"
-              % (len(names), len(defaults), enums["weight_mode"], enums["azimuth_mode"],
+    detail = ("%d 预设 / names=%d / defaults=%d 键 / enums(weight_mode=%s,az=%s,el=%s) / vocab=%d 键"
+              % (len(presets), len(names), len(defaults), enums["weight_mode"], enums["azimuth_mode"],
                  enums["elevation_mode"], len(d.get("vocab") or {})))
     if miss_gen:
         detail += "  ⚠ defaults 缺生成字段 %s" % miss_gen
@@ -378,7 +378,12 @@ def check_config():
 def check_ui_presets():
     name = "ui_presets 增删回环"
     pname = "_QA_%d_%d" % (os.getpid(), random.randint(1000, 9999))
-    vals = [0.11, -0.22, 0.33, 0.44]
+    # v2：预设是 17 键 dict（旧式 4 元组仍兼容，但回读必须补齐新键）
+    vals = {"pos_x": 0.11, "pos_y": -0.22, "pos_z": 0.33, "roll": 0.44,
+            "focal": 24.0, "pan_x": 0.15, "pan_y": -0.1, "subject_yaw": 0.45,
+            "gaze_mode": "away", "preset": "自定义", "strength": 1.2,
+            "weight_mode": "tanh", "azimuth_mode": "8bin", "elevation_mode": "3bin",
+            "neg_strength": 1.0, "extra_positive": "", "extra_negative": ""}
     try:
         code, raw, _ = http("POST", "/api/ui_presets", {"name": pname, "vals": vals})
         if code not in (200, 201):
@@ -389,12 +394,23 @@ def check_ui_presets():
         if got is None:
             return bad(name, "POST 后在 /api/meta.ui_presets 找不到 %s（实际 %s）"
                        % (pname, list((d.get("ui_presets") or {}).keys())[:8]))
-        try:
-            near = [round(float(a), 3) for a in got] == [round(float(b), 3) for b in vals]
-        except Exception:
-            near = got == vals
-        if not near:
-            return bad(name, "回读值不符：%r ≠ %r" % (got, vals))
+        if not isinstance(got, dict):
+            return bad(name, "回读不是 dict（v2 预设应为 17 键字典）：%r" % (got,))
+        diff = {}
+        for k, want in vals.items():
+            have = got.get(k)
+            if isinstance(want, str):
+                if str(have) != want:
+                    diff[k] = (have, want)
+            else:
+                try:
+                    if abs(float(have) - float(want)) > 5e-3:
+                        diff[k] = (have, want)
+                except Exception:
+                    diff[k] = (have, want)
+        if diff:
+            return bad(name, "回读值不符：%r" % (diff,))
+        near = "%d 键一致（含 focal/gaze_mode）" % len(vals)
         code, raw, _ = http("DELETE", q("/api/ui_presets", name=pname))
         if code not in (200, 204):
             return bad(name, "DELETE → HTTP %s body=%s" % (code, head(raw)))
@@ -489,11 +505,11 @@ def check_static():
         problems.append("/ 返回体里没有 id=view3d（%d 字节）" % len(raw))
     html_bytes = len(raw) if code == 200 else 0
 
-    code2, raw2, ct2 = http("GET", "/vendor/three.module.js")
+    code2, raw2, ct2 = http("GET", "/js/three.module.js")
     if code2 != 200:
-        problems.append("/vendor/three.module.js → HTTP %s" % code2)
+        problems.append("/js/three.module.js → HTTP %s" % code2)
     elif "javascript" not in ct2.lower():
-        problems.append("/vendor/three.module.js Content-Type=%r（应 text/javascript）" % ct2)
+        problems.append("/js/three.module.js Content-Type=%r（应 text/javascript）" % ct2)
     three_bytes = len(raw2) if code2 == 200 else 0
 
     code3, raw3, ct3 = http("GET", "/app.js")

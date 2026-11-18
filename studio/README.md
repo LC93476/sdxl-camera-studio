@@ -151,35 +151,44 @@ canvas `#view3d`，球体 + 人偶参考，三个手柄：
 短语按逗号拆成多个 tag **分别**加权，写成 `(from front:1.40), (eye level shot)` 这种 A1111 语法；
 `|w-1| < 0.005` 时输出裸短语。平视 eye 的 raw 权重固定 1.0，所以正常情况下它就是个裸词。
 
-`camera_info` 字段：`azimuth_deg`（`pos_x*180`）、`elev_deg`（`pos_y*90`）、`bin`、`bins`（各档占比）、
-`elevation`、`distance`、`dutch`、`az_gate`、`preset`、`strength`、`weight_mode`、`azimuth_mode`、
-`elevation_mode`、`neg_strength`、`parts`、`negative_parts`。
+`camera_info` 字段（v2）：`azimuth_deg`（`pos_x*180`）、`elev_deg`（`pos_y*90`）、`bin`、
+`bins`（**三元组** `[key, ratio, kind]`，kind ∈ az/el/di/lens/tg/frame/subject/gaze）、`elevation`、`distance`、
+`dutch`、`roll_deg`、`fov_deg`、`focal`、`lens`、`az_gate`、`pole_gate`、`azimuth_suppressed`、`behind_ratio`、
+`framing`、`subject`、`gaze`、`subject_yaw`、`pan`、`preset`、`strength`、`weight_mode`、`azimuth_mode`、
+`elevation_mode`、`neg_strength`、`parts`、`negative_parts`。`parts[]` 每项带 `kind/key/ratio/raw/weight/phrase/tokens`。
 
 ## 5. 预设
 
-内置 **11 个**（`core/presets.py` 的 `PRESETS`），下拉首项「自定义」（`PRESET_NAMES` 共 12 项）：
+内置 **16 个**（`core/presets.py` 的 `PRESETS` + `PRESET_EXTRAS`），下拉首项「自定义」（`PRESET_NAMES` 共 17 项）：
 
-| 预设 | (pos_x, pos_y, pos_z, roll) | 实际档位 |
-|---|---|---|
-| 正面平视中景 | (0.0, 0.0, 0.0, 0.0) | front + eye + medium |
-| 正面仰视全身 | (0.0, -0.55, -0.5, 0.0) | front + low + full |
-| 正面俯视中景 | (0.0, 0.55, 0.0, 0.0) | front + high + medium |
-| 右侧90度中景 | (0.5, 0.0, 0.0, 0.0) | right + eye + medium |
-| 背面全身 | (1.0, 0.0, -0.5, 0.0) | back + eye + full |
-| 左前方45度近景 | (-0.25, 0.0, 0.35, 0.0) | front_left + eye + cu |
-| 右后方45度中景 | (0.75, 0.0, 0.0, 0.0) | back_right + eye + medium |
-| 虫瞰极限仰视 | (0.0, -1.0, -0.85, 0.0) | worm（5bin）+ wide，方位关闭 |
-| 鸟瞰极限俯视 | (0.0, 1.0, -0.85, 0.0) | bird（5bin）+ wide，方位关闭 |
-| 荷兰角倾斜中景 | (0.0, 0.0, 0.0, 0.45) | front + eye + medium + dutch |
-| 特写面部 | (0.0, 0.0, 0.85, 0.0) | front + eye + ecu |
+| 预设 | (pos_x, pos_y, pos_z, roll) | 附加参数 | 实际档位 |
+|---|---|---|---|
+| 正面平视中景 | (0, 0, 0, 0) | — | front + eye + medium |
+| 正面仰视全身 | (0, −0.55, −0.5, 0) | — | front + low + full |
+| 正面俯视中景 | (0, 0.55, 0, 0) | — | front + high + medium |
+| 右侧90度中景 | (0.5, 0, 0, 0) | — | right + eye + medium |
+| 背面全身 | (1, 0, −0.5, 0) | — | back + eye + full |
+| 左前方45度近景 | (−0.25, 0, 0.35, 0) | — | front_left + eye + cu |
+| 右后方45度中景 | (0.75, 0, 0, 0) | — | back_right + eye + medium |
+| 虫瞰极限仰视 | (0, −1, −0.85, 0) | `elevation_mode=5bin, strength=0.7` | worm + wide，方位关闭 |
+| 鸟瞰极限俯视 | (0, 1, −0.85, 0) | `elevation_mode=5bin, strength=0.7` | bird + wide，方位关闭 |
+| 荷兰角倾斜中景 | (0, 0, 0, 0.45) | — | front + eye + medium + dutch |
+| 特写面部 | (0, 0, 0.85, 0) | — | front + eye + ecu |
+| 长焦人像85mm | (0, 0, 0.1, 0) | `focal=85` | 85mm + 浅景深压缩 |
+| 广角环境24mm | (0, 0, −0.5, 0) | `focal=24` | 24mm + 环境叙事 |
+| 三分法偏右 | (0, 0, 0, 0) | `focal=35, pan_x=−0.35` | 主体落右三分线 |
+| 回眸背面机位 | (1, 0, 0.1, 0) | `focal=85, subject_yaw=−0.45, gaze_mode=camera` | back + 3/4 侧身 + 回眸 |
+| 荷兰角负斜 | (0, 0, 0, −0.45) | `focal=50` | 反向倾斜 −20° |
 
 - **鸟瞰 / 虫瞰自动切档**：`PRESET_MODES` 把这两个预设的 `elevation_mode` 强制成 `5bin`、`strength` 压到 `0.7`
   （极端俯仰在 Illustrious 系上吃重权重会糊成贴图）。前端选预设时同步改滑块，后端 `compute_camera` 里再覆盖一次。
-- 选预设会**覆盖四个滑块**；再动任意滑块就回到「自定义」。
-- **「保存预设」**把当前 `[pos_x, pos_y, pos_z, roll]` 存进 `ui_presets`，落盘 `state/presets.json`。
-  命名用浏览器 `prompt()` 输入框，最长 40 字符，同名再存覆盖。
-- 用户预设只是「记住四个数字」：后端只认 `PRESETS` 里的名字，**不认识的 preset 名会把滑块值原样使用**（不报错、不换档）。
-- 界面上**没有删除用户预设的按钮**，只能调 `DELETE /api/ui_presets?name=…` 或手工改 `presets.json`。
+- 选预设会**覆盖机位与光学参数**（`pos_*/roll/focal/pan_*/subject_yaw/gaze_mode`）；再动任意滑块就回到「自定义」。
+  覆盖逻辑在 `core/camera_core.py` 的 `compute_camera` 开头（先做 `preset_params` 成员判断再覆盖，未知预设名不动滑块）。
+- **「保存预设」**把当前 17 键参数（位置 + 光学 + 档位 + extras）存进 `ui_presets`，落盘 `state/presets.json`；
+  旧版 `[pos_x, pos_y, pos_z, roll]` 四元组仍能读入，其余键补默认值（`store._coerce_preset`）。
+- 用户预设与 `PRESETS` 是两套东西：后端只认 `PRESETS` 里的名字，**不认识的 preset 名会把滑块值原样使用**（不报错、不换档）。
+- 预设可 **导出 / 导入**（`/api/ui_presets/export` 下载 `ui_presets.json`、`/api/ui_presets/import` 合并导入），
+  删除走 `DELETE /api/ui_presets?name=…`。
 
 ## 5b. 外部工作流模板（相机词 → 生产工作流）
 
@@ -236,6 +245,21 @@ canvas `#view3d`，球体 + 人偶参考，三个手柄：
    （自带朝向）比 `(side view:1.40)` 更硬。要严格控机位就选朝向与目标一致的姿势，或用 t2i 模板。
 3. **偶发风格漂移**：上表第 2 行那张黑白线稿是偶发（同参数换分辨率即恢复），遇到就换 seed
    （界面勾 `randomize`）重跑，不必改提示词。
+### 5d. v2 参数实测（API 图直连，832×1216 · 26 步 · cfg 5.0 · euler_ancestral/karras）
+
+v2 新参数（focal / roll / pan / subject_yaw / gaze）不走工作台模板，用 API 格式图直连 `/prompt` 验证；
+同一个 `CameraAngleSDXL` 节点换成 api 图即可（工作流 JSON 是 UI 格式，直接 POST 会 500）。
+
+| # | 参数 | 正向串关键段 | 出图 |
+|---|---|---|---|
+| 1 | pos_x=1.0 pos_z=0.1 focal=85 pan_x=0.35 subject_yaw=-0.45 gaze=camera | from behind ×3, 85mm/telephoto/bokeh, subject on the left third, body turned three-quarters away | 背影 3/4 回眸 + 左侧构图 + 强浅景深，全部对上 |
+| 2 | pos_x=0.5 pos_y=0.35 pos_z=0.3 focal=14 | side view from the right, high angle, ultra wide angle / strong perspective distortion | 右前上方 + 明显广角透视收敛 |
+| 3 | pos_y=-0.95 focal=24（虫瞰极点） | low angle shot, from below, looking up, looking down at the viewer | 丛林里贴地仰拍、透视冲天 —— 极点消歧生效 |
+| 4 | pos_y=0.95 focal=50（鸟瞰极点） | high angle shot, from above, looking up at the viewer | 高机位俯拍 + 主体抬头（改 POLE_GAZE 前同参数出的是背面站姿） |
+| 5 | pos_x=0.4 roll=0.3 pan_x=-0.4（荷兰角） | dutch angle / canted framing / tilted horizon, subject on the right third | 地平线倾斜 + 主体偏右三分线 |
+
+> 极点两条最能说明问题：竖直机位下 `looking at viewer` 会把画面拉回「正面站立」，所以 |pos_y|>0.75 时视线短语
+> 改写成 `looking up/down at the viewer`（`POLE_GAZE`），配合 `POLE_BLOCK_TOKENS` 剔掉的正面词，顶视/仰拍才真的出得来。
 
 ## 6. HTTP API
 

@@ -81,3 +81,55 @@ neg_strength ∈ [0,2]，weight_mode ∈ {tanh, linear, raw}，azimuth_mode ∈ 
   点击出 lightbox（滚轮缩放、←→ 切换）。
 - 视觉：深色 #16171b 底 + #ffd75e 强调，无外部字体/图标（内联 SVG 或 unicode）。
 - 不得用 localStorage（配置走 /api/config）。
+
+## v2 增补（视角系统升级）
+
+### 归属（v2 新增）
+
+| 路径 | 归属 |
+|---|---|
+| core/camera_core.py, core/presets.py | Lead（唯一真源；backend/frontend 只读） |
+| js/camera_shared.js | Lead（Py→JS 镜像算法 + 坐标系常量，双端共用） |
+| js/three.module.js | Lead（唯一一份，studio 通过 /js/ 静态路由复用） |
+| tools/token_count.py | backend（纯标准库 token 统计） |
+| studio/web/* | frontend |
+| tools/*.py, tests/*, docs/*, SPEC.md | Lead |
+
+### 参数集合（v2）
+
+CAM_KEYS += focal, pan_x, pan_y, subject_yaw, gaze_mode。
+默认值 {"focal":50,"pan_x":0,"pan_y":0,"subject_yaw":0,"gaze_mode":"auto"}。
+预设不再只是名字：presets.preset_params(name) 返回完整覆盖 dict
+（pos_*/roll/focal/pan_*/subject_yaw/gaze_mode/elevation_mode/strength），后端与节点都必须用它。
+compute_camera 返回 parts[]，每项 {kind,key,raw,weight,phrase,tokens[]}，可直接逐段数 token。
+
+### 后端新增端点（全部 JSON）
+
+1. GET /api/meta 追加：focals:[14,24,35,50,85,135]、gaze_modes:["auto","camera","away"]、sequences:{name:desc}、vendored:[...]。
+2. POST /api/preview 返回追加：token_parts:[{kind,key,text,tokens}]、tokens:{positive,negative,total,method}（method=tokenizer|estimate）。
+3. GET /api/ui_presets/export → 附件下载 JSON（Content-Disposition: attachment），体为 {"version":2,"presets":{name:vals}}。
+4. POST /api/ui_presets/import body {"presets":{...}} → 合并写入 {ok, added, ui_presets}。
+5. GET /api/sequences → {names:[...], sequences:{name:{desc,shots:[{label,params}]}}}。
+6. POST /api/sequence body {"name":"三视图…","base":{…相机与生成参数…},"same_seed":true,"seed":123}
+   → {ok, name, shots:[{label, prompt_id, seed, positive, negative, params}]}；逐张 submit；
+   ComfyUI 离线时整单 503 且不得半提交。
+7. GET /js/<file> → 从仓库根 js/ 出静态文件（three.module.js、camera_shared.js），resolve 后必须仍在 js 根内。
+8. DELETE /api/ui_presets?name= 保持不变。
+
+### 前端新增 DOM id（必须存在）
+
+focal, focal_label, pan_x, pan_y, subject_yaw, gaze_mode, btn_focal_preset,
+token_total, token_parts, btn_seq, seq_select, seq_run, seq_strip, grid_overlay, ref_overlay, ref_opacity, ref_file,
+btn_hud_toggle, btn_export_presets, btn_import_presets, import_file
+
+### frontend 交互要求（v2）
+
+- 3D：透视相机 fov 跟随 focal 实时变化；相机视锥（frustum）随 FOV 收缩/张开；取景框内叠加三分法九宫格 + 地平线；
+  主体脚下画正面箭头 + 视线锥（跟着 subject_yaw 转）；支持参考图叠层（本地 file → objectURL → 半透明背景，ref_opacity 调）。
+- 快捷键：1..6 切换标准机位（正 / 背 / 左正侧 / 右正侧 / 高角度 / 低角度），R 重置，G 切换九宫格，F 切换视锥。
+- 序列：seq_select 选内置序列 → seq_run 一次提交，seq_strip 并排展示每张进度与成品（复用 /api/progress）。
+- Token 预算：token_badge/token_total 高亮当前相机提示词占用（>60 转黄、>90 转红），token_parts 列出每个片段与 token 数。
+- 预设：btn_save_preset 保存当前全部 v2 参数；btn_export_presets 走 /api/ui_presets/export；btn_import_presets + import_file 走 import。
+- 3D 复用：studio/web/camera3d.js 必须 import "/js/three.module.js" 与 "/js/camera_shared.js"；
+  studio/web/vendor/three.module.js 已删除，不要再引用。
+

@@ -697,3 +697,386 @@ input[type="checkbox"] {
   .slider-grid { grid-template-columns: 1fr; }
   .srow.wide { grid-column: auto; }
 }
+
+/* ═════════════════ v2 增补：焦段档 / 取景叠层 / HUD / Token 预算 / 序列 ═════════════════ */
+
+/* ── 焦段快捷档 ── */
+.chip-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  min-width: 0;
+}
+
+.srow.focal-row .chip-row { grid-column: 2 / 4; }
+
+/* focal 的读数比普通滑块长（mm + 视场角），单独给宽一点 */
+.srow.focal-val { grid-template-columns: 92px minmax(0, 1fr) 92px; }
+.srow.focal-val .val { white-space: nowrap; }
+
+.chip {
+  appearance: none;
+  -webkit-appearance: none;
+  border: 1px solid var(--line);
+  background: var(--panel-2);
+  color: var(--muted);
+  font: inherit;
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
+  line-height: 1;
+  padding: 4px 9px;
+  border-radius: 999px;
+  cursor: pointer;
+  transition: background 130ms ease, color 130ms ease, border-color 130ms ease;
+}
+
+.chip:hover { color: var(--text); border-color: #3b3f4a; }
+
+.chip.on {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #1b1c20;
+  font-weight: 600;
+}
+
+/* 本地参考图选择框（只读进内存，不上传） */
+input[type="file"] {
+  width: 100%;
+  font: inherit;
+  font-size: 11px;
+  color: var(--muted);
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  padding: 4px 6px;
+  cursor: pointer;
+}
+
+input[type="file"]::file-selector-button {
+  appearance: none;
+  -webkit-appearance: none;
+  margin-right: 8px;
+  padding: 2px 9px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--panel);
+  color: var(--text);
+  font: inherit;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+input[type="file"]::file-selector-button:hover { border-color: var(--accent); color: var(--accent); }
+
+/* ── 取景框叠层：参考图 + 三分法九宫格 + 地平线 ── */
+.ref-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  opacity: 0.35;
+  pointer-events: none;
+  transition: opacity 120ms ease;
+}
+
+.ref-overlay[hidden] { display: none; }
+
+.grid-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  pointer-events: none;
+  transition: opacity 140ms ease;
+}
+
+.grid-overlay.off { opacity: 0; }
+
+.grid-overlay .gl {
+  position: absolute;
+  background: rgba(231, 232, 234, 0.24);
+  box-shadow: 0 0 4px rgba(0, 0, 0, 0.5);
+}
+
+.grid-overlay .gl-v1,
+.grid-overlay .gl-v2 {
+  top: 3%;
+  bottom: 3%;
+  width: 1px;
+}
+
+.grid-overlay .gl-v1 { left: 33.333%; }
+.grid-overlay .gl-v2 { left: 66.666%; }
+
+.grid-overlay .gl-h1,
+.grid-overlay .gl-h2 {
+  left: 3%;
+  right: 3%;
+  height: 1px;
+}
+
+.grid-overlay .gl-h1 { top: 33.333%; }
+.grid-overlay .gl-h2 { top: 66.666%; }
+
+.grid-overlay .gl-hz {
+  left: 0;
+  right: 0;
+  top: 50%;
+  height: 1px;
+  background: rgba(255, 215, 94, 0.6);
+}
+
+.grid-overlay .gl-hz::after {
+  content: "地平线";
+  position: absolute;
+  right: 7px;
+  top: -15px;
+  font-size: 9.5px;
+  letter-spacing: 0.6px;
+  color: rgba(255, 215, 94, 0.82);
+}
+
+/* ── 视口 HUD ── */
+.hud {
+  position: absolute;
+  top: 10px;
+  left: 10px;
+  z-index: 3;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  max-width: calc(100% - 92px);
+  pointer-events: none;
+}
+
+.hud-chip {
+  padding: 3px 8px;
+  border-radius: 999px;
+  background: rgba(22, 23, 27, 0.78);
+  border: 1px solid var(--line);
+  color: var(--muted);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  backdrop-filter: blur(4px);
+}
+
+.hud-chip.hud-framing {
+  color: #ffe9a3;
+  border-color: rgba(255, 215, 94, 0.34);
+}
+
+.hud-btn {
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  z-index: 4;
+}
+
+.hud-btn.on { color: var(--accent); border-color: rgba(255, 215, 94, 0.5); }
+
+/* HUD 关闭时连九宫格一起收起来 */
+.viewport.hud-off .hud,
+.viewport.hud-off .grid-overlay { display: none; }
+
+/* ── Token 预算 ── */
+.token-panel { margin-top: 8px; }
+
+.token-parts {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  max-height: 210px;
+  overflow: auto;
+  padding-right: 2px;
+}
+
+.tk-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-areas: "kind num" "text text";
+  gap: 1px 8px;
+  padding: 3px 0;
+  border-bottom: 1px dashed rgba(44, 47, 56, 0.7);
+  font-size: 11px;
+}
+
+.tk-row:last-child { border-bottom: none; }
+
+.tk-kind {
+  grid-area: kind;
+  color: var(--violet);
+  font-size: 10px;
+  letter-spacing: 0.4px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.tk-text {
+  grid-area: text;
+  color: var(--text);
+  font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+  font-size: 10.5px;
+  line-height: 1.35;
+  white-space: normal;
+  word-break: break-word;
+  opacity: 0.9;
+}
+
+.tk-num {
+  grid-area: num;
+  text-align: right;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.tk-num.hot { color: var(--accent); }
+
+.tk-empty {
+  color: var(--muted);
+  font-size: 11px;
+  padding: 2px 0;
+}
+
+/* token 总量：> 60 黄，> 90 红（阈值在 app.js 的 TOKEN_WARN / TOKEN_DANGER） */
+.badge.warn {
+  background: rgba(255, 215, 94, 0.16);
+  border-color: rgba(255, 215, 94, 0.55);
+  color: var(--accent);
+}
+
+.badge.danger {
+  background: rgba(244, 113, 110, 0.18);
+  border-color: rgba(244, 113, 110, 0.6);
+  color: #ffb3b0;
+}
+
+.badge.soft.warn {
+  background: rgba(255, 215, 94, 0.14);
+  border-color: rgba(255, 215, 94, 0.5);
+  color: var(--accent);
+}
+
+.badge.soft.danger {
+  background: rgba(244, 113, 110, 0.16);
+  border-color: rgba(244, 113, 110, 0.55);
+  color: #ffb3b0;
+}
+
+/* ── 序列对比 ── */
+.seq-panel {
+  display: none;
+  flex-direction: column;
+  gap: 7px;
+  margin-top: 4px;
+}
+
+.seq-panel.open { display: flex; }
+
+.seq-controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.field-inline.grow {
+  flex: 1 1 190px;
+  min-width: 0;
+}
+
+.field-inline.grow select { flex: 1 1 auto; min-width: 0; }
+
+.field-inline.chk { gap: 5px; }
+.field-inline.chk input { margin: 0; }
+
+.seq-desc {
+  color: var(--muted);
+  font-size: 10.5px;
+  line-height: 1.45;
+  max-height: 32px;
+  overflow: hidden;
+}
+
+.seq-strip {
+  display: flex;
+  gap: 8px;
+  overflow-x: auto;
+  padding-bottom: 4px;
+  scroll-snap-type: x proximity;
+}
+
+.seq-strip:empty::after {
+  content: "选一个序列 → 运行，机位会并排铺在这里";
+  color: var(--muted);
+  font-size: 11px;
+  padding: 6px 2px;
+}
+
+.seq-card {
+  flex: 0 0 138px;
+  margin: 0;
+  scroll-snap-align: start;
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  overflow: hidden;
+  cursor: zoom-in;
+}
+
+.seq-card:hover { border-color: rgba(255, 215, 94, 0.45); }
+
+.seq-cap {
+  padding: 3px 6px;
+  font-size: 10px;
+  color: var(--text);
+  background: rgba(22, 23, 27, 0.7);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.seq-body {
+  position: relative;
+  aspect-ratio: 1 / 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: #14151a;
+}
+
+.seq-body img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+
+.seq-ph {
+  color: var(--muted);
+  font-size: 10.5px;
+  text-align: center;
+  padding: 0 8px;
+  line-height: 1.5;
+}
+
+.seq-meta {
+  padding: 2px 6px 3px;
+  font-size: 9.5px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.lb-img { transform-origin: center center; transition: transform 90ms ease; }
+
+@media (max-width: 1180px) {
+  .hud { max-width: calc(100% - 84px); }
+  .seq-card { flex-basis: 124px; }
+  .token-parts { max-height: 118px; }
+}
+

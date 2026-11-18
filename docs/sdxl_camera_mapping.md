@@ -621,3 +621,163 @@ B 中前缀 (10 词 + 3 段相机)      -> 1 chunk, 45/77 slots
 C 长前缀 (16 词 + 3 段相机)      -> 1 chunk, 66/77 slots   <- 已贴边
 D 长前缀(72 tok) + rich 相机(53) -> 2 chunks: 75 + 27
 ```
+
+---
+
+## 10. v2 增补：光学、倾斜、构图、主体朝向、极点消歧
+
+> 本节对应 SPEC 第 7–9 节与 `core/camera_core.py` v2 实现。所有数值均由 `compute_camera()` 实跑得出（脚本见文末），不是推演。
+
+### 10.1 焦距 → FOV → 词条（`focal`，8–400mm）
+
+水平 FOV 用 36mm 画幅算：`fov = 2·atan(36/(2f))`。档位由 `LENS_BANDS` 决定，**区间左闭右开**，超出 135 归 135 档：
+
+| focal 输入 | 命中档位 | tanh 权重 | 水平 FOV | 正向词条 |
+|---|---|---|---|---|
+| 14 / 18 | `lens14` | 1.30 | 104.25° / 90.00° | ultra wide angle lens, 14mm, strong perspective distortion, exaggerated foreshortening, deep depth of field |
+| 24 | `lens24` | 1.22 | 73.74° | wide angle lens, 24mm, wide perspective, deep depth of field, environmental context |
+| 35 | `lens35` | 1.11 | 54.43° | 35mm lens, natural perspective, environmental portrait |
+| 50 | `lens50` | **1.00（裸写）** | 39.60° | 50mm lens, standard perspective, natural proportions |
+| 85 | `lens85` | 1.26 | 23.91° | 85mm lens, telephoto compression, shallow depth of field, background blur, bokeh |
+| 135+ | `lens135` | 1.30 | 15.19° | 135mm telephoto lens, strong spatial compression, creamy bokeh, isolated subject |
+
+三点必须记住：
+
+1. **50mm 是中性档，权重恰好 1.0，所以输出裸短语不带括号**。任何"权重必须带括号"的断言都会在这里挂 —— 这不是 bug。
+2. 超广角/长焦用 1.30 而不是 1.5+：>1.5 沿空 prompt 方向外插，必出噪点（§3.3）。
+3. 焦距**不改**机位（pos_x/y/z），只改透视与景深语义 —— 想真的"退后拉近"要同时动 `pos_z`。`LENS_WEIGHT` 与 `LENS_BANDS` 在 `core/camera_core.py` 与 `js/camera_shared.js` 里必须逐字一致（`tools/parity_check.py` 会查）。
+
+### 10.2 倾斜 roll（±45°）
+
+`roll_deg = roll × 45`，阈值 `|roll| > 0.25` 才发声（11.25°，低于此值 SDXL 基本看不出来，白占 token）：
+
+| roll | 角度 | 正向词条 | 权重 |
+|---|---|---|---|
+| 0.26 | 11.7° | dutch angle, canted framing, tilted horizon | 1.03 |
+| 0.5 | 22.5° | 同上 | 1.13 |
+| 1.0 | 45.0° | 同上 | 1.30 |
+| −0.5 | −22.5° | dutch angle, reverse canted framing, tilted frame | 1.13 |
+| −1.0 | −45.0° | 同上 | 1.30 |
+
+负值是**反向倾斜**，不是"不倾斜"。`roll` 只进正向词与负向镜像（`tilted horizon` 在负向里做对照），不影响方位/高度档位。
+
+### 10.3 构图偏移 pan（三分法）
+
+`pan_x / pan_y` 描述的是**相机相对主体的平移**，不是主体自己动：
+
+| 参数 | 语义 | 正向词条 |
+|---|---|---|
+| `pan_x = +0.5` | 相机右移 → 主体落到**左**三分线，右侧留白 | subject placed on the left third, rule of thirds, off-center composition, negative space on the right |
+| `pan_x = −0.5` | 相机左移 → 主体落到**右**三分线 | subject placed on the right third, rule of thirds, off-center composition, negative space on the left |
+| `pan_y = +0.4` | 主体压低，上方留白，地平线偏低 | extra headroom above, subject in the lower third, low horizon line |
+| `pan_y = −0.4` | 主体抬高，前景引线 | subject in the upper third, foreground leading space |
+| 两项都 `|v| < 0.12` | 居中构图 | **默认不发词**（`subject_center` 只在 `framing.emit_center` 打开时输出） |
+
+居中之所以默认静默：SDXL 对"centered composition"的响应是把主体缩小到画面中央 40% 区域，正常中景会因此变弱；默认不发等于"不做额外干扰"，需要时再开。
+
+### 10.4 主体朝向 / 视线（`subject_yaw` + `gaze_mode`）—— 与机位解耦
+
+这是 v2 最容易被误用的部分：**机位（pos_x）决定"相机在哪"，subject_yaw 决定"人朝哪"**，两者互不推导。
+
+`|subject_yaw|` 分档（`FRAME_KEYS` 之外的 `SUBJECT_KEYS`）：
+
+| 区间 | 档位 | 词条 | 实测权重 |
+|---|---|---|---|
+| < 0.28 | `subject_front` | （正面机位时不发，避免与 front view 重复；背面机位下改发正面词） | — |
+| 0.28 – 0.72 | `subject_turn` | body turned three-quarters away from the camera | 1.12（yaw 0.45）/ 1.15（yaw 0.6） |
+| > 0.72 | `subject_away` | facing away, back turned to the camera | 1.19（yaw 0.9） |
+
+视线 `gaze_mode`（默认 `auto`，按朝向推导）：
+
+| 条件 | 档位 | 词条 | 权重 |
+|---|---|---|---|
+| `auto` + `|yaw| <= 0.72` | `gaze_viewer` | looking at viewer, direct eye contact | 1.00 裸写 |
+| `auto` + `0.28 < |yaw| <= 0.72` 且 `behind_ratio > 0.45` | `gaze_over_shoulder` | looking back over the shoulder at the viewer | 1.30 raw → **1.05** |
+| `auto` + `|yaw| > 0.72` | `gaze_away` | looking away, gaze averted | 1.00 裸写 |
+| `camera`（强制） | `gaze_viewer` | 同上 | 1.00 |
+| `away`（强制） | `gaze_away` | 同上 | 1.00 |
+
+`behind_ratio` 是机位落在背面扇区的比例：只有"相机在身后 + 人半转身"才成立"回眸"，正面机位下不管 yaw 多大都不该发 over the shoulder。这条规则是被实测逼出来的 —— 正面机位硬发回眸，SDXL 会把人连同背景一起扭头。
+
+**背面机位 + `subject_yaw = 0` 的特例**：此时 gaze 是 `gaze_viewer` 而不是 over_shoulder。语义上"人面向镜头、相机在背后"是不可能的组合，实现选择让视线跟随显式参数，朝向交给机位词，不制造矛盾词条。
+
+### 10.5 极点消歧（|pos_y| > 0.75）
+
+两个门控：
+
+```
+az_gate(y)   = clamp((1 - |y|) / 0.10, 0, 1)     # 方位词随高度衰减
+pole_gate(y) = clamp((1 - |y|) / 0.25, 0, 1)     # 极点区内整体衰减
+有效门 = az_gate × pole_gate；< 0.12 直接抑制（azimuth_suppressed=True，连 negative 一起关）
+```
+
+实测（`azimuth_mode=8bin`）：
+
+| pos_y | pos_x | pole_gate | 发方位词 | 说明 |
+|---|---|---|---|---|
+| 0.75 | 0 | 1.00 | front | 极点边界，尚未衰减 |
+| 0.80 | ±1.0 | 0.80 | back | 衰减到 0.8，词还在但要屏蔽互斥词 |
+| 0.95 | 0 | 0.20 | **无**（suppressed） | 有效门 0.2×0.2=0.04 < 0.12 |
+| 1.00 | 0 | 0.00 | **无** | 纯垂直机位 |
+| −0.8 | ±1.0 | 0.80 | back | 虫瞰同规则 |
+
+高度词（`EL_KEYS`）**不受极点抑制**，py=0.95 仍然发 `high`：极点处"从上往下"这件事本身就是要表达的，被压掉的只是"从哪个方向"。
+
+互斥词屏蔽表 `POLE_BLOCK_TOKENS`（`core/camera_core.py:153-159`）：
+
+| 极点 | 从方位词里剔除 | 原因 |
+|---|---|---|
+| 鸟瞰（py > 0.75） | from behind, seen from behind, back view, front view, straight-on shot, facing the camera, eye level shot, looking at viewer, direct eye contact | 实测 py=0.8 且 |px|=1.0 时会出现 "from behind" + "top-down view" 并存 → 出图变成半背半俯的空镜 |
+| 虫瞰（py < −0.75） | eye level shot, top-down view, looking down at viewer, from above, high angle, bird's-eye view | 同上，反方向 |
+
+这张表是 v2 里唯一"靠实测反复修出来"的常量，改它必须跑 `tools/sweep_camera.py --mode elevation --tag v2` 重扫。
+
+**视线改写 `POLE_GAZE`（`core/camera_core.py`，同步在 `js/camera_shared.js`）**
+
+屏蔽表把 "looking at viewer / direct eye contact" 从**方位**词里剔掉了，但视线段是独立生成的，py=0.95 仍会补上一句 "looking at viewer"，于是模型照样画一个正面站立的人像（实测 v2_pole_top：py=0.95 出的是背面回眸站姿，不是顶视）。修法是给极点区换视线短语，而不是删掉视线：
+
+| 极点 | 原短语 | 改写为 |
+|---|---|---|
+| 鸟瞰（py > 0.75） | looking at viewer, direct eye contact | looking up at the viewer |
+| 虫瞰（py < -0.75） | 同上 | looking down at the viewer |
+
+判定按 **py 的正负**，不按 `ekey`：`elevation_mode` 默认 3bin 时 `ekey` 是 `high`/`low`，只有 5bin 才是 `bird`/`worm`，用 `ekey` 查表在默认档会静默失效（踩过一次）。
+
+改完重跑：`python tests/test_core.py`（`test_pole_conflicts` 断言 py=0.95 -> looking up at the viewer、py=-0.95 -> looking down at the viewer、py=0.5 保持原短语）、`python tools/parity_check.py`（比对 `POLE_GAZE` 2 条），然后**重启 ComfyUI** 才生效 —— 节点进程里 `camera_core` 已被 import 缓存，改文件不重启不会变。
+
+### 10.6 `camera_info` 新增字段
+
+| 字段 | 类型 | 含义 |
+|---|---|---|
+| `fov_deg` | float | 水平 FOV，由 focal 算 |
+| `focal` | float | 输入焦距 |
+| `lens` | str | 命中档位（lens14 … lens135） |
+| `roll_deg` | float | roll × 45 |
+| `pole_gate` | float | 极点门控值 0–1 |
+| `azimuth_suppressed` | bool | 是否因极点压掉方位词 |
+| `behind_ratio` | float | 机位在背面扇区的比例（回眸判据） |
+| `framing` | list[str] | 命中的构图档位 |
+| `subject` / `gaze` | str | 命中的朝向/视线档位 |
+| `subject_yaw` / `pan` | dict | 回显输入 |
+| `bins` | list | `[[key, ratio, kind]]`，kind ∈ az/el/di/lens/tg/frame/subject/gaze |
+
+`bins` 带 kind 是 v2 的破坏性变更：老调用方按 `bins[i][0]` 取 key 仍然对，但"`bins` 只有方位"的假设不再成立（测试里用 `az_bins()` 过滤 `kind == "az"`）。
+
+### 10.7 v2 的 token 预算（真分词器实测）
+
+| 场景 | 正向 / 负向 token | 说明 |
+|---|---|---|
+| 默认（正面平视中景 50mm） | 40 / 38 | 光学 50mm 裸写省 token |
+| `pos_x=1`（背面） | 49 / 44 | 背面词组更长（from behind / back view / seen from behind） |
+| 鸟瞰极限俯视 | 37 / 23 | 方位词被极点抑制 + 互斥词剔除，负向同时变短 |
+
+结论不变（§1.4）：相机段整体仍在 75 token 以内，一块够用；但**极点 + 长焦 + 构图 + 朝向同时开**会到 ~70，逼近边界，此时应关掉不用的轴（`strength` 不动，直接让对应参数归零）。
+
+### 10.8 复跑
+
+```bash
+cd D:/QUARK/sdxl_camera_angle
+PYTHONIOENCODING=utf-8 python tests/test_core.py          # 15 项单测
+PYTHONIOENCODING=utf-8 python tools/parity_check.py       # Python ↔ JS 常量逐字一致
+PYTHONIOENCODING=utf-8 python tools/validate_workflow.py  # 工作流 widgets 与节点 INPUT_TYPES 对齐
+```

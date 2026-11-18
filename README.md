@@ -92,8 +92,13 @@ python sdxl_camera_angle/tests/test_core.py     # 纯 assert 自测
 | `pos_x` | FLOAT -1..1 / 0.05 | 0.0 | 方位角，`θ = pos_x·π`。0 正面，0.5 正右侧，±1 背面 |
 | `pos_y` | FLOAT -1..1 / 0.01 | 0.0 | 高度。>0.2 俯视，-0.2..0.2 平视，<-0.2 仰视；\|y\|>0.9 方位权重开始衰减 |
 | `pos_z` | FLOAT -1..1 / 0.05 | 0.0 | 距离。>0.7 特写 / >0.2 近景 / ≥0 中景 / >-0.35 牛仔 / ≥-0.7 全身 / 更远 远景 |
-| `roll` | FLOAT 0..1 / 0.10 | 0.0 | 倾斜，>0 输出 dutch angle |
-| `preset` | COMBO（12 项） | 自定义 | 非「自定义」时**预设姿态覆盖 4 个滑块**（滑块值仍留在 UI 上） |
+| `roll` | FLOAT -1..1 / 0.10 | 0.0 | 倾斜，`roll_deg = roll×45`；|roll|>0.25 输出 dutch angle，负值 = 反向倾斜 |
+| `focal` | FLOAT 8..400 / 1.0 | 50.0 | 等效焦距：14 超广角 / 24 广角 / 35 人文 / 50 标准 / 85 人像 / 135 长焦（同时决定 `fov_deg`） |
+| `pan_x` | FLOAT -1..1 / 0.05 | 0.0 | 构图横移：>0 相机右移 → 主体偏左三分线，右侧留白 |
+| `pan_y` | FLOAT -1..1 / 0.05 | 0.0 | 构图纵移：>0 主体压低（上方留白、地平线偏低），<0 主体抬高 |
+| `subject_yaw` | FLOAT -1..1 / 0.05 | 0.0 | **主体朝向**（与机位解耦）：0 面向镜头，±0.45 侧身 3/4，±0.9 完全背对 |
+| `gaze_mode` | auto / camera / away | auto | 视线：auto 按朝向与机位推导（含回眸）；camera 强制看镜头；away 强制看别处 |
+| `preset` | COMBO（17 项） | 自定义 | 非「自定义」时**预设覆盖机位与光学参数**（滑块值仍留在 UI 上，动滑块会自动跳回自定义） |
 | `strength` | FLOAT 0..2 / 0.05 | 1.0 | 权重曲线强度，0 = 全部中性（只剩裸短语） |
 | `weight_mode` | tanh / linear / raw | tanh | tanh 推荐；linear 线性截断；raw 直通（调试对比用） |
 | `azimuth_mode` | 8bin / 4bin | 8bin | 8bin = 8 方向 + 双档插值；4bin = 原仓库 cos/sin 四向分解 |
@@ -105,16 +110,26 @@ python sdxl_camera_angle/tests/test_core.py     # 纯 assert 自测
 
 输出：`positive` STRING、`negative` STRING、`camera_info` STRING(JSON)。
 
-`camera_info` 示例（`compute_camera(0,0,0,0)`）：
+`camera_info` 示例（`compute_camera(0,0,0,0)`，节选）：
 
 ```json
-{"azimuth_deg": 0.0, "elev_deg": 0.0, "bin": "front", "bins": [["front", 1.0]],
- "elevation": "eye", "distance": "medium", "dutch": false, "az_gate": 1.0,
- "preset": "自定义", "strength": 1.0, "weight_mode": "tanh", "azimuth_mode": "8bin",
- "elevation_mode": "3bin", "neg_strength": 1.0,
- "parts": [["front view, straight-on shot, looking at viewer", 1.4]],
- "negative_parts": [["from behind, back view, seen from behind", 1.4]]}
+{"azimuth_deg": 0.0, "elev_deg": 0.0, "fov_deg": 39.6, "focal": 50.0, "lens": "lens50",
+ "bin": "front", "bins": [["front", 1.0, "az"], ["eye", 1.0, "el"], ["medium", 1.0, "di"],
+                          ["lens50", 1.0, "lens"], ["gaze_viewer", 1.0, "gaze"]],
+ "elevation": "eye", "distance": "medium", "dutch": false, "roll_deg": 0.0,
+ "az_gate": 1.0, "pole_gate": 1.0, "azimuth_suppressed": false, "behind_ratio": 0.0,
+ "framing": [], "subject": "subject_front", "gaze": "gaze_viewer",
+ "subject_yaw": 0.0, "pan": [0.0, 0.0],
+ "preset": "自定义", "strength": 1.0, "weight_mode": "tanh",
+ "azimuth_mode": "8bin", "elevation_mode": "3bin", "neg_strength": 0.0,
+ "parts": [{"kind": "az", "key": "front", "ratio": 1.0, "raw": 10.0, "weight": 1.4,
+            "phrase": "front view, straight-on shot, facing the camera",
+            "tokens": ["(front view:1.40)", "(straight-on shot:1.40)", "(facing the camera:1.40)"]}],
+ "negative_parts": []}
 ```
+
+`bins` 是三元组 `[key, ratio, kind]`，`kind` ∈ `az/el/di/lens/tg/frame/subject/gaze` —— 只看方位就过滤 `kind == "az"`。
+`parts[].tokens` 是最终写进提示词的字符串（含权重括号），可直接做 token 预算。
 
 `_cfg_json` 覆盖示例（只写要改的键，其余走默认值，深合并）：
 
@@ -126,19 +141,26 @@ python sdxl_camera_angle/tests/test_core.py     # 纯 assert 自测
 
 ## 预设表
 
-| 预设 | (pos_x, pos_y, pos_z, roll) | 实际档位 |
-|---|---|---|
-| 正面平视中景 | (0.0, 0.0, 0.0, 0.0) | front + eye + medium |
-| 正面仰视全身 | (0.0, -0.55, -0.5, 0.0) | front + low + full |
-| 正面俯视中景 | (0.0, 0.55, 0.0, 0.0) | front + high + medium |
-| 右侧90度中景 | (0.5, 0.0, 0.0, 0.0) | right + eye + medium |
-| 背面全身 | (1.0, 0.0, -0.5, 0.0) | back + eye + full |
-| 左前方45度近景 | (-0.25, 0.0, 0.35, 0.0) | front_left + eye + cu |
-| 右后方45度中景 | (0.75, 0.0, 0.0, 0.0) | back_right + eye + medium |
-| 虫瞰极限仰视 | (0.0, -1.0, 0.0, 0.0) | low（5bin 时 worm）+ medium，方位关闭 |
-| 鸟瞰极限俯视 | (0.0, 1.0, 0.0, 0.0) | high（5bin 时 bird）+ medium，方位关闭 |
-| 荷兰角倾斜中景 | (0.0, 0.0, 0.0, 0.45) | front + eye + medium + dutch |
-| 特写面部 | (0.0, 0.0, 0.85, 0.0) | front + eye + ecu |
+| 预设 | (pos_x, pos_y, pos_z, roll) | 附加参数 | 实际档位 |
+|---|---|---|---|
+| 正面平视中景 | (0, 0, 0, 0) | — | front + eye + medium + 50mm |
+| 正面仰视全身 | (0, −0.55, −0.5, 0) | — | front + low + full |
+| 正面俯视中景 | (0, 0.55, 0, 0) | — | front + high + medium |
+| 右侧90度中景 | (0.5, 0, 0, 0) | — | right + eye + medium |
+| 背面全身 | (1, 0, −0.5, 0) | — | back + eye + full |
+| 左前方45度近景 | (−0.25, 0, 0.35, 0) | — | front_left + eye + cu |
+| 右后方45度中景 | (0.75, 0, 0, 0) | — | back_right + eye + medium |
+| 虫瞰极限仰视 | (0, −1, −0.85, 0) | `elevation_mode=5bin, strength=0.7` | low（5bin → worm）+ full，方位关闭 |
+| 鸟瞰极限俯视 | (0, 1, −0.85, 0) | `elevation_mode=5bin, strength=0.7` | high（5bin → bird）+ full，方位关闭 |
+| 荷兰角倾斜中景 | (0, 0, 0, 0.45) | — | front + eye + medium + dutch(20°) |
+| 特写面部 | (0, 0, 0.85, 0) | — | front + eye + ecu |
+| **长焦人像85mm** | (0, 0, 0.1, 0) | `focal=85` | 85mm + 浅景深压缩 |
+| **广角环境24mm** | (0, 0, −0.5, 0) | `focal=24` | 24mm 广角 + 环境叙事 |
+| **三分法偏右** | (0, 0, 0, 0) | `focal=35, pan_x=−0.35` | 主体落右三分线 |
+| **回眸背面机位** | (1, 0, 0.1, 0) | `focal=85, subject_yaw=−0.45, gaze_mode=camera` | back + 3/4 侧身 + 回眸 |
+| **荷兰角负斜** | (0, 0, 0, −0.45) | `focal=50` | 反向倾斜 −20° |
+
+后 5 条（加粗）是 v2 新增：光学焦距与构图/朝向的组合示例，配方在 `core/presets.py` 的 `PRESET_EXTRAS`。
 
 ## SDXL 权重为什么必须压缩
 
@@ -216,22 +238,37 @@ SDXL 的两个文本编码器（CLIP-L 与 OpenCLIP-bigG）都是 **75 token/块
 
 ## 手动调节摄像机出图
 
-**方式一：节点滑块**（最快）。装好后拖 `pos_x / pos_y / pos_z / roll` 四个滑块，或点 `preset` 选
-11 个预设之一。预设会覆盖滑块值；再动任意滑块会自动跳回「自定义」。
+**方式一：节点滑块**（最快）。9 个机位/光学滑块 + 3 个档位开关：
 
-**方式二：3D 视口直接拖**（`js/sdxl_camera_widget.js`）。节点下方多出一块 three.js 画布：
+- 机位：`pos_x`（绕人转）、`pos_y`（升降）、`pos_z`（远近）、`roll`（±45° 倾斜）
+- 光学与构图：`focal`（8–400mm）、`pan_x` / `pan_y`（三分法偏移）
+- 主体：`subject_yaw`（人朝哪，和机位无关）、`gaze_mode`（auto / camera / away）
+- `preset` 选 16 个预设之一会**覆盖上面这些值**（含 focal/pan/yaw）；再动任意滑块自动跳回「自定义」。
 
-- 粉色点（紫环上）→ 拖 = 绕人转方位；青色点（青弧上）→ 拖 = 升降高度；
-- 黄点（球外侧）→ 拖 = 远近；画布滚轮 = 整体推拉；
-- 画布下方实时显示当前档位（如 `front_left · high · medium · dutch`）与正/负向预览，拖动时同步写回
-  node widget；
-- 「归位」= 全部回零，「标签」= 打开词表编辑，「预设」= 12 项下拉。
+**方式二：节点里的 3D 视口**（`js/sdxl_camera_widget.js` + `js/camera_shared.js`）。节点下方一块 three.js 画布：
 
-**方式三：工作流文件**。`D:/QUARK/SDXL.CameraAngle.json` 是一套即插即用的完整图：
+- 粉色点（紫环上）→ 拖 = 绕人转方位；青色点（青弧上）→ 拖 = 升降高度；黄点（球外侧）→ 拖 = 远近；滚轮 = 整体推拉；
+- 视锥线框随 `focal` 实时收放（FOV 由焦距算），叠加**九宫格 + 地平线**辅助构图，脚下箭头 + 视线锥表示 `subject_yaw`；
+- 快捷键：`1` 正面 `2` 背面 `3` 左正侧 `4` 右正侧 `5` 高俯 `6` 低仰 `R` 重置 `G` 九宫格开关 `F` 视锥开关；
+- 画布下方实时显示档位（如 `front_left · high · medium · 85mm`）、FOV 与正/负向预览，拖动即写回 node widget。
+
+**方式三：桌面工作台**（`studio/`，双击 `studio/launch.bat`）。同一套算法 + 同一套常量（`js/camera_shared.js` 单一真源），
+但带参考图叠层、多机位序列条、CLIP token 预算面板、预设导入导出，直接把图提交给 ComfyUI。
+
+**方式四：工作流文件**。`workflows/SDXL.CameraAngle.json`（根目录也放了一份）是即插即用的完整图：
 Checkpoint → LoRA(可删) → 相机节点 → 正/负 CLIPTextEncode → KSampler → VAE → SaveImage，
-已通过结构校验（9 节点 13 连线，类型、槽位、widget 数量全部对得上 `/object_info`）。
+已通过结构校验（9 节点 13 连线，widget 顺序与 `INPUT_TYPES` 逐项对齐）。
 
-**方式四：批量扫角**。`tools/sweep_camera.py` 直接走 API，一次出 9 个方位 / 7 个高度 / 6 个距离，
+**方式五：批量扫参数**。`tools/sweep_camera.py` 直接走 API：
+
+```bash
+python tools/sweep_camera.py --mode azimuth      # 9 个方位
+python tools/sweep_camera.py --mode focal        # 14/24/35/50/85/135mm
+python tools/sweep_camera.py --mode pan          # 三分法横移 × 纵向
+python tools/sweep_camera.py --mode subject      # 朝向 / 回眸
+python tools/sweep_camera.py --mode sequence     # 三视图 / 推拉序列
+```
+
 自动拼对比图 —— 用来标定你的底模到底吃不吃角度词。
 
 ## 常见问题
@@ -284,18 +321,32 @@ Checkpoint → LoRA(可删) → 相机节点 → 正/负 CLIPTextEncode → KSam
 
 ```bash
 "D:/QUARK/ComfyUI-aki-v3.2/python/python.exe" tools/sweep_camera.py --mode azimuth
-# --mode elevation|distance|roll|weight|preset|ab   --tag v2 加后缀   --lora 0 关 LoRA
+# --mode elevation|distance|roll|weight|preset|focal|pan|subject|sequence|ab
+# --tag v2 加后缀   --lora 0 关 LoRA   --focal 85 换光学档
 ```
 
 已出过的图存在 `out/raw/` 下，重跑会自动复用（只补缺口）。
-## 自测
+## 自测（四项门禁）
 
-```
-python sdxl_camera_angle/tests/test_core.py
+```bash
+cd D:/QUARK/sdxl_camera_angle
+export PYTHONIOENCODING=utf-8          # Windows 下中文输出必须
+
+python tests/test_core.py              # 1) 15 组算法单测
+python tools/parity_check.py           # 2) Python ↔ js/camera_shared.js 常量/词表逐字一致
+python tools/validate_workflow.py workflows/SDXL.CameraAngle.json   # 3) 工作流 widgets ↔ 节点 INPUT_TYPES
+python studio/tools/check_ui.py        # 4a) 工作台静态契约
+python studio/tools/e2e_test.py        # 4b) 工作台接口 + 真实出图（需要 ComfyUI 在线）
 ```
 
-覆盖：权重曲线校验值、8 档方位 + 双档插值、`az_gate` 门控、距离 6 档边界、dutch、
-负向开关、权重全域区间、预设覆盖滑块、cfg 深合并、camera_info 可 JSON 化。
+当前状态：**15 组单测全过 / parity TOTAL 差异 0 / 工作流 9 节点 13 连线全对齐 / check_ui 11 项 PASS /
+e2e PASS 13 FAIL 0 SKIP 1**。
+
+单测覆盖：权重曲线校验值、8 档方位 + 双档插值、`az_gate`/`pole_gate` 门控、距离 6 档边界、
+焦距 6 档 + FOV、roll ±45° 阈值、三分法构图、主体朝向与视线解耦（含回眸）、极点互斥词剔除、
+负向开关、权重全域区间、16 预设 + 4 序列、cfg 深合并、camera_info 可 JSON 化。
+
+> 本机没装 `pytest`，`test_core.py` 是自带 `main()` 的独立脚本，直接 `python` 跑。
 
 ## 已知边界
 
@@ -304,6 +355,14 @@ python sdxl_camera_angle/tests/test_core.py
 - `elevation_mode="5bin"` 在 \|pos_y\|=0.75 处是硬切换（high ↔ bird），没有双档混合。
 - SPEC 2.1 校验表里 `raw=0.5 → 0.92` 与曲线公式实际值 `0.93` 差 0.01：这里**按公式实现**
   （公式是准的，0.92 是手算笔误），单测断言 0.93。
+- 焦距只改**透视语义与景深**，不真的移动相机；"退后拉近"要同时动 `pos_z`。
+- `pan_x/pan_y` 是相机平移而非主体平移（`pan_x>0` → 主体偏左三分线）。两者混用会得到"主体没动但背景歪了"的图。
+- 极点区（\|pos_y\|>0.75）方位词会衰减/关闭，此时`pos_x` 基本无效 —— 这是刻意的，不是 bug。
+  极点区还会把视线短语从 `looking at viewer` 换成 `looking up/down at the viewer`（`POLE_GAZE`），
+  否则竖直机位会退化成「正面/背面站立」。鸟瞰（py>0.75）实测更偏高机位俯拍而非严格正上方顶视，
+  要更硬的正顶视请用 `elevation_mode="5bin"` 并把 `strength` 提到 1.2 以上。
+- `tools/parity_check.py` 是**静态正则**比对（本机无 node），能保证常量与词表一致，不能保证 JS 运行时无异常；
+  运行时验证靠 `js/sdxl_camera_widget.js` 的桩环境实跑与工作台 `e2e`。
 
 ## 发布到 GitHub
 

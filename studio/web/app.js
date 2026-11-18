@@ -1,15 +1,16 @@
 /**
- * app.js —— SDXL 相机工作台前端主控
+ * app.js —— SDXL 相机工作台前端主控（v2）
  *
  * 职责：
  *   1. 组装 CameraRig（3D）+ 滑块，双向同步，200ms 防抖调 /api/preview
  *   2. 生成流程：/api/generate → 700ms 轮询 /api/progress → 进度条 / 状态 / 画廊插顶
- *   3. 启动引导：/api/meta、/api/config、/api/comfy/models、/api/health、/api/gallery
- *   4. 画廊 + lightbox（滚轮缩放、←→ 切换、Esc / 点背景关闭）
+ *   3. v2：focal/pan_x/pan_y/subject_yaw/gaze_mode、token 预算面板、序列并排对比、预设导入导出
+ *   4. 启动引导：/api/meta、/api/config、/api/comfy/models、/api/health、/api/gallery、/api/sequences
  *
  * 后端离线时页面照常可用：所有请求都走 try/catch，只在 #status 里说真话。
  */
 import { CameraRig } from './camera3d.js';
+import { focalToFov, framingKeys, subjectKeys } from '/js/camera_shared.js';
 
 const API = {
   health: '/api/health',
@@ -21,6 +22,10 @@ const API = {
   models: '/api/comfy/models',
   config: '/api/config',
   uiPresets: '/api/ui_presets',
+  presetsExport: '/api/ui_presets/export',
+  presetsImport: '/api/ui_presets/import',
+  sequences: '/api/sequences',
+  sequence: '/api/sequence',
   interrupt: '/api/interrupt',
   openFolder: '/api/open_folder',
   progress: (promptId) => '/api/progress?prompt_id=' + encodeURIComponent(promptId),
@@ -28,8 +33,17 @@ const API = {
 
 const $ = (id) => document.getElementById(id);
 
+// token 预算阈值（正向 + 负向合计）：过 60 转黄，过 90 转红
+const TOKEN_WARN = 60;
+const TOKEN_DANGER = 90;
+
+// focal 快捷档（mm）
+const FOCAL_STOPS = [14, 24, 35, 50, 85, 135];
+
 const DEFAULTS = {
   pos_x: 0, pos_y: 0, pos_z: 0, roll: 0,
+  focal: 50, pan_x: 0, pan_y: 0, subject_yaw: 0, gaze_mode: 'auto',
+  ref_opacity: 0.35,
   preset: '自定义', strength: 1, weight_mode: 'tanh',
   azimuth_mode: '8bin', elevation_mode: '3bin', neg_strength: 1,
   extra_positive: '', extra_negative: '',
@@ -43,6 +57,7 @@ const ENUM_FALLBACK = {
   weight_mode: ['tanh', 'linear', 'raw'],
   azimuth_mode: ['8bin', '4bin'],
   elevation_mode: ['3bin', '5bin'],
+  gaze_mode: ['auto', 'camera', 'away'],
 };
 
 const CN_BIN = {
@@ -51,8 +66,21 @@ const CN_BIN = {
 };
 const CN_EL = { high: '俯视', eye: '平视', low: '仰视', bird: '鸟瞰', worm: '虫瞰' };
 const CN_DIST = { ecu: '特写', cu: '近景', medium: '中景', cowboy: '牛仔', full: '全身', wide: '远景' };
+const CN_LENS = { lens14: '14mm', lens24: '24mm', lens35: '35mm', lens50: '50mm', lens85: '85mm', lens135: '135mm' };
+const CN_FRAME = {
+  subject_left: '主体偏左', subject_right: '主体偏右', subject_center: '居中',
+  subject_low: '主体偏低', subject_high: '主体偏高',
+};
+const CN_SUBJECT = { subject_front: '正面朝向', subject_turn: '四分之三侧身', subject_away: '背身' };
+const CN_GAZE = { gaze_viewer: '看镜头', gaze_away: '视线离镜', gaze_over_shoulder: '回眸看镜头' };
+// token 分段 kind 码 → 中文（后端 kind 就是 az/el/di/lens/gaze 这些短码）
+const TK_KIND = {
+  az: '方位', el: '高度', di: '距离', lens: '镜头', gaze: '视线',
+  subject: '朝向', framing: '构图', extra: '附加', manual: '手动', weight: '权重',
+};
 
-const CAM_KEYS = ['pos_x', 'pos_y', 'pos_z', 'roll'];
+// 数值型相机滑块（行为一致的走同一套绑定）
+const CAM_KEYS = ['pos_x', 'pos_y', 'pos_z', 'roll', 'pan_x', 'pan_y', 'subject_yaw'];
 const CAM_TEXT_KEYS = ['extra_positive', 'extra_negative', 'manual_positive', 'manual_negative'];
 
 const S = Object.assign({}, DEFAULTS);
@@ -62,6 +90,7 @@ let meta = null;
 let metaPresets = {};
 let uiPresets = {};
 let presetModes = {};
+let seqDefs = {};
 
 let previewSeq = 0;
 let previewTimer = 0;
@@ -72,6 +101,9 @@ let promptId = null;
 let pollTimer = 0;
 let genBusy = false;
 let lastSeed = null;
+
+let seqTimers = [];
+let seqRunning = false;
 
 let lbList = [];
 let lbIndex = 0;
@@ -146,6 +178,55 @@ function refreshReadouts() {
     const el = readout(k);
     if (el) el.textContent = num(S[k]).toFixed(2);
   });
+  const ro = readout('ref_opacity');
+  if (ro) ro.textContent = num(S.ref_opacity, 0.35).toFixed(2);
+  updateFocalUI();
+  updateFramingHint();
+}
+
+// ─────────────────────────── 焦段 / 构图提示 ───────────────────────────
+
+function focalValue() {
+  return Math.round(clamp(num(S.focal, 50), 14, 200));
+}
+
+function updateFocalUI() {
+  const f = focalValue();
+  const label = $('focal_label');
+  if (label) label.textContent = f + 'mm · ' + focalToFov(f).toFixed(1) + '°';
+  const row = $('btn_focal_preset');
+  if (!row) return;
+  Array.prototype.slice.call(row.querySelectorAll('.chip')).forEach((b) => {
+    b.classList.toggle('on', Math.round(num(b.dataset.focal)) === f);
+  });
+}
+
+/** 三分法/构图提示：pan_x、pan_y、subject_yaw、gaze_mode 一句话说明 */
+function framingWords() {
+  const out = [];
+  let keys = [];
+  try {
+    keys = framingKeys(num(S.pan_x), num(S.pan_y)) || [];
+  } catch (_) {
+    keys = [];
+  }
+  if (keys.length) out.push(keys.map((k) => CN_FRAME[k[0]] || k[0]).join(' + '));
+  let sk = null;
+  try {
+    sk = subjectKeys(num(S.subject_yaw), num(S.pos_x), S.gaze_mode);
+  } catch (_) {
+    sk = null;
+  }
+  if (sk) {
+    out.push(CN_SUBJECT[sk[0]] || sk[0]);
+    out.push(CN_GAZE[sk[1]] || sk[1]);
+  }
+  return out.length ? out.join(' · ') : '居中构图';
+}
+
+function updateFramingHint() {
+  const el = $('framing_hint');
+  if (el) el.textContent = framingWords();
 }
 
 // ─────────────────────────── 载荷 ───────────────────────────
@@ -156,6 +237,11 @@ function cameraPayload() {
     pos_y: num(S.pos_y),
     pos_z: num(S.pos_z),
     roll: num(S.roll),
+    focal: focalValue(),
+    pan_x: num(S.pan_x),
+    pan_y: num(S.pan_y),
+    subject_yaw: num(S.subject_yaw),
+    gaze_mode: S.gaze_mode || 'auto',
     preset: S.preset || '自定义',
     strength: num(S.strength, 1),
     weight_mode: S.weight_mode || 'tanh',
@@ -202,8 +288,7 @@ async function runPreview() {
     if (seq !== previewSeq) return;
     $('positive_out').textContent = data && typeof data.positive === 'string' ? data.positive : '';
     $('negative_out').textContent = data && typeof data.negative === 'string' ? data.negative : '';
-    const tk = (data && data.tokens) || {};
-    $('token_badge').textContent = 'P ' + (tk.positive || 0) + ' · N ' + (tk.negative || 0);
+    renderTokens(data);
     let info = infoLine(data && data.camera_info);
     const warn = data && Array.isArray(data.warn) ? data.warn.filter(Boolean) : [];
     if (warn.length) info = info + ' · ⚠ ' + warn.join('；');
@@ -230,14 +315,105 @@ function infoLine(info) {
   if (Number.isFinite(info.azimuth_deg)) parts.push('方位角 ' + info.azimuth_deg + '°');
   if (Number.isFinite(info.elev_deg)) parts.push('仰角 ' + info.elev_deg + '°');
   if (Number.isFinite(info.az_gate) && info.az_gate < 1) parts.push('方位闸门 ' + info.az_gate);
+  if (Number.isFinite(info.focal)) parts.push(Math.round(info.focal) + 'mm');
+  if (Number.isFinite(info.fov_deg)) parts.push('FOV ' + info.fov_deg + '°');
+  if (info.lens) parts.push(CN_LENS[info.lens] || String(info.lens));
+  if (Array.isArray(info.framing) && info.framing.length) {
+    parts.push(info.framing.map((k) => CN_FRAME[k[0] || k] || k).join(' + '));
+  }
+  if (Array.isArray(info.subject) && info.subject.length) {
+    parts.push(info.subject.map((k) => CN_SUBJECT[k] || CN_GAZE[k] || k).join(' / '));
+  }
   return parts.length ? parts.join(' · ') : '—';
+}
+
+// ─────────────────────────── Token 预算 ───────────────────────────
+
+function tokenClass(total) {
+  if (total > TOKEN_DANGER) return 'danger';
+  if (total > TOKEN_WARN) return 'warn';
+  return '';
+}
+
+function paintTokenBadges(total) {
+  const cls = tokenClass(total);
+  const badge = $('token_badge');
+  if (badge) {
+    badge.classList.toggle('warn', cls === 'warn');
+    badge.classList.toggle('danger', cls === 'danger');
+  }
+  const tot = $('token_total');
+  if (tot) {
+    tot.classList.toggle('warn', cls === 'warn');
+    tot.classList.toggle('danger', cls === 'danger');
+  }
+}
+
+function renderTokens(data) {
+  const tk = (data && data.tokens) || {};
+  const pos = Math.round(num(tk.positive, 0));
+  const neg = Math.round(num(tk.negative, 0));
+  const total = tk.total != null ? Math.round(num(tk.total, pos + neg)) : pos + neg;
+  const method = tk.method ? String(tk.method) : 'estimate';
+
+  const badge = $('token_badge');
+  if (badge) badge.textContent = 'T ' + total + ' · P ' + pos + ' · N ' + neg;
+  const tot = $('token_total');
+  if (tot) tot.textContent = '总 ' + total + ' / ' + method;
+  paintTokenBadges(total);
+
+  const list = $('token_parts');
+  if (!list) return;
+  list.textContent = '';
+  const parts = (data && Array.isArray(data.token_parts)) ? data.token_parts : [];
+  if (!parts.length) {
+    const ph = document.createElement('div');
+    ph.className = 'tk-empty';
+    ph.textContent = '（后端未返回 token_parts）';
+    list.appendChild(ph);
+    return;
+  }
+  parts.forEach((p) => {
+    const row = document.createElement('div');
+    row.className = 'tk-row';
+
+    const kind = document.createElement('span');
+    kind.className = 'tk-kind';
+    const code = String((p && p.kind) || 'part');
+    kind.textContent = TK_KIND[code] ? code + ' · ' + TK_KIND[code] : code;
+
+    const text = document.createElement('span');
+    text.className = 'tk-text';
+    text.textContent = String((p && p.text) || '');
+
+    const n = document.createElement('span');
+    n.className = 'tk-num';
+    const cnt = Math.round(num(p && p.tokens, 0));
+    n.textContent = String(cnt);
+    n.classList.toggle('hot', cnt >= 12);
+
+    row.appendChild(kind);
+    row.appendChild(text);
+    row.appendChild(n);
+    list.appendChild(row);
+  });
 }
 
 // ─────────────────────────── 双向同步 ───────────────────────────
 
 function pushRig() {
   if (!rig || syncing) return;
-  rig.setState({ pos_x: num(S.pos_x), pos_y: num(S.pos_y), pos_z: num(S.pos_z), roll: num(S.roll) });
+  rig.setState({
+    pos_x: num(S.pos_x),
+    pos_y: num(S.pos_y),
+    pos_z: num(S.pos_z),
+    roll: num(S.roll),
+    focal: focalValue(),
+    pan_x: num(S.pan_x),
+    pan_y: num(S.pan_y),
+    subject_yaw: num(S.subject_yaw),
+    gaze_mode: S.gaze_mode || 'auto',
+  });
 }
 
 function writeCameraUI() {
@@ -246,11 +422,15 @@ function writeCameraUI() {
     const el = $(k);
     if (el) el.value = String(num(S[k]));
   });
+  const fo = $('focal');
+  if (fo) fo.value = String(focalValue());
+  const ro = $('ref_opacity');
+  if (ro) ro.value = String(num(S.ref_opacity, 0.35));
   ['strength', 'neg_strength'].forEach((k) => {
     const el = $(k);
     if (el) el.value = String(num(S[k]));
   });
-  ['weight_mode', 'azimuth_mode', 'elevation_mode'].forEach((k) => {
+  ['weight_mode', 'azimuth_mode', 'elevation_mode', 'gaze_mode'].forEach((k) => {
     const el = $(k);
     if (el && S[k] != null) el.value = String(S[k]);
   });
@@ -271,6 +451,8 @@ function onRigChange(v) {
   CAM_KEYS.forEach((k) => {
     if (Number.isFinite(v[k])) S[k] = v[k];
   });
+  if (Number.isFinite(v.focal)) S.focal = Math.round(clamp(v.focal, 14, 200));
+  if (typeof v.gaze_mode === 'string' && v.gaze_mode) S.gaze_mode = v.gaze_mode;
   writeCameraUI();
   markCustom();
   schedulePreview();
@@ -474,8 +656,8 @@ function loadGallery(raw) {
 
 // ─────────────────────────── lightbox ───────────────────────────
 
-function openLightbox(index) {
-  lbList = tileList();
+function openLightbox(index, list) {
+  lbList = Array.isArray(list) && list.length ? list : tileList();
   if (!lbList.length) return;
   lbIndex = clamp(index, 0, lbList.length - 1);
   lbZoom = 1;
@@ -589,6 +771,15 @@ function flashCopy(btn, ok) {
 
 // ─────────────────────────── 预设 / 启动数据 ───────────────────────────
 
+function presetDict(raw) {
+  if (Array.isArray(raw)) {
+    if (raw.length < 4) return null;
+    return { pos_x: num(raw[0]), pos_y: num(raw[1]), pos_z: num(raw[2]), roll: num(raw[3]) };
+  }
+  if (raw && typeof raw === 'object') return raw;
+  return null;
+}
+
 function fillPresetSelect(names) {
   const sel = $('preset');
   if (!sel) return;
@@ -639,7 +830,9 @@ function fillEnums(enums) {
   Object.keys(ENUM_FALLBACK).forEach((key) => {
     const el = $(key);
     if (!el) return;
-    const values = enums && Array.isArray(enums[key]) && enums[key].length ? enums[key] : ENUM_FALLBACK[key];
+    let values = ENUM_FALLBACK[key];
+    if (enums && Array.isArray(enums[key]) && enums[key].length) values = enums[key];
+    else if (key === 'gaze_mode' && meta && Array.isArray(meta.gaze_modes) && meta.gaze_modes.length) values = meta.gaze_modes;
     el.textContent = '';
     values.forEach((v) => {
       const o = document.createElement('option');
@@ -757,15 +950,19 @@ function applyHealth(data) {
 
 // ─────────────────────────── 用户操作 ───────────────────────────
 
+/** 选中预设：dict 里所有键都写回 UI（旧式 4 元组按 pos/roll 处理） */
 function applyPreset(name) {
   S.preset = name === undefined ? '自定义' : name;
-  const vals = metaPresets[S.preset] || uiPresets[S.preset];
-  if (S.preset !== '自定义' && Array.isArray(vals) && vals.length >= 4) {
-    S.pos_x = clamp(num(vals[0]), -1, 1);
-    S.pos_y = clamp(num(vals[1]), -1, 1);
-    S.pos_z = clamp(num(vals[2]), -1, 1);
-    S.roll = clamp(num(vals[3]), 0, 1);
-
+  const dict = presetDict(metaPresets[S.preset] || uiPresets[S.preset]);
+  if (S.preset !== '自定义' && dict) {
+    Object.keys(dict).forEach((k) => {
+      if (k === 'preset' || k === 'lora_name') return;
+      if (!(k in DEFAULTS)) return;
+      const v = dict[k];
+      if (k === 'randomize') { S[k] = !!v; return; }
+      if (typeof DEFAULTS[k] === 'number') S[k] = num(v, DEFAULTS[k]);
+      else S[k] = v == null ? DEFAULTS[k] : String(v);
+    });
     const mode = presetModes[S.preset];
     if (mode && typeof mode === 'object') {
       if (mode.elevation_mode != null) S.elevation_mode = String(mode.elevation_mode);
@@ -774,14 +971,14 @@ function applyPreset(name) {
   }
   writeCameraUI();
   pushRig();
+  syncGenUI();
   schedulePreview();
   scheduleConfigSave();
 }
 
 function resetAll() {
-  const keepPreset = '自定义';
   Object.keys(DEFAULTS).forEach((k) => { S[k] = DEFAULTS[k]; });
-  S.preset = keepPreset;
+  S.preset = '自定义';
   writeCameraUI();
   pushRig();
   syncGenUI();
@@ -807,19 +1004,216 @@ async function onSavePreset() {
   const name = window.prompt('预设名称', '我的机位');
   if (!name) return;
   try {
-    const res = await postJSON(API.uiPresets, {
-      name: name,
-      vals: [num(S.pos_x), num(S.pos_y), num(S.pos_z), num(S.roll)],
-    });
+    const res = await postJSON(API.uiPresets, { name: name, vals: cameraPayload() });
     if (res && res.ui_presets && typeof res.ui_presets === 'object') uiPresets = res.ui_presets;
     S.preset = name;
     const names = (meta && Array.isArray(meta.preset_names)) ? meta.preset_names : Object.keys(metaPresets);
     fillPresetSelect(names);
     const sel = $('preset');
     if (sel) sel.value = name;
-    setStatus('已保存预设「' + name + '」', 'ok');
+    setStatus('已保存预设「' + name + '」（含 focal/pan/subject_yaw/gaze_mode）', 'ok');
   } catch (err) {
     setStatus('保存预设失败：' + err.message, 'err');
+  }
+}
+
+function exportPresets() {
+  const a = document.createElement('a');
+  a.href = API.presetsExport;
+  a.rel = 'noopener';
+  a.download = 'ui_presets.json';
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setStatus('已请求导出预设（若无下载，确认后端 /api/ui_presets/export）', 'ok');
+}
+
+async function importPresets(file) {
+  if (!file) return;
+  try {
+    const text = await file.text();
+    const parsed = JSON.parse(text);
+    const presets = (parsed && parsed.presets && typeof parsed.presets === 'object') ? parsed.presets : parsed;
+    const res = await postJSON(API.presetsImport, { presets: presets });
+    if (res && res.ui_presets && typeof res.ui_presets === 'object') uiPresets = res.ui_presets;
+    const names = (meta && Array.isArray(meta.preset_names)) ? meta.preset_names : Object.keys(metaPresets);
+    fillPresetSelect(names);
+    setStatus('已导入预设 · 新增 ' + Math.round(num(res && res.added, 0)) + ' 个', 'ok');
+  } catch (err) {
+    setStatus('导入预设失败：' + err.message, 'err');
+  }
+}
+
+// ─────────────────────────── 序列 ───────────────────────────
+
+function clearSeqTimers() {
+  seqTimers.forEach((t) => clearTimeout(t));
+  seqTimers = [];
+}
+
+function fillSeqSelect(data) {
+  const sel = $('seq_select');
+  if (!sel) return;
+  const seqs = (data && data.sequences && typeof data.sequences === 'object') ? data.sequences : {};
+  seqDefs = seqs;
+  const names = (data && Array.isArray(data.names) && data.names.length) ? data.names : Object.keys(seqs);
+  sel.textContent = '';
+  if (!names.length) {
+    const o = document.createElement('option');
+    o.value = '';
+    o.textContent = '（后端未提供序列）';
+    sel.appendChild(o);
+    return;
+  }
+  names.forEach((n) => {
+    const o = document.createElement('option');
+    o.value = n;
+    o.textContent = n;
+    sel.appendChild(o);
+  });
+  updateSeqDesc();
+}
+
+function updateSeqDesc() {
+  const sel = $('seq_select');
+  const el = $('seq_desc');
+  if (!el) return;
+  const name = sel ? sel.value : '';
+  const def = seqDefs[name];
+  if (!def) {
+    el.textContent = '';
+    return;
+  }
+  const shots = Array.isArray(def.shots) ? def.shots : [];
+  const labels = shots.map((s) => String((s && s.label) || '机位')).join(' · ');
+  el.textContent = (def.desc ? def.desc + ' · ' : '') + shots.length + ' 张：' + labels;
+}
+
+function updateSeqCount() {
+  const strip = $('seq_strip');
+  const n = strip ? strip.querySelectorAll('.seq-card img').length : 0;
+  setBadge('seq-count', n + ' 张');
+}
+
+function addSeqCard(shot) {
+  const strip = $('seq_strip');
+  if (!strip) return null;
+
+  const card = document.createElement('figure');
+  card.className = 'seq-card';
+  card.dataset.url = '';
+
+  const cap = document.createElement('figcaption');
+  cap.className = 'seq-cap';
+  cap.textContent = String((shot && shot.label) || '机位');
+
+  const body = document.createElement('div');
+  body.className = 'seq-body';
+  const ph = document.createElement('div');
+  ph.className = 'seq-ph';
+  ph.textContent = '排队…';
+  body.appendChild(ph);
+
+  const meta = document.createElement('div');
+  meta.className = 'seq-meta';
+  meta.textContent = 'seed ' + (shot && shot.seed != null ? shot.seed : '—');
+
+  card.appendChild(cap);
+  card.appendChild(body);
+  card.appendChild(meta);
+  strip.appendChild(card);
+
+  return { card: card, ph: ph, meta: meta };
+}
+
+function seqUrls() {
+  const strip = $('seq_strip');
+  if (!strip) return [];
+  return Array.prototype.slice.call(strip.querySelectorAll('.seq-card')).map((c) => ({
+    url: c.dataset.url,
+    seed: '',
+    cap: (c.querySelector('.seq-cap') || {}).textContent || '',
+  })).filter((x) => !!x.url);
+}
+
+function pollSeqShot(shot, ui) {
+  if (!shot || !shot.prompt_id || !ui) return;
+  const tick = async () => {
+    try {
+      const p = (await api(API.progress(shot.prompt_id))) || {};
+      const state = String(p.state || '');
+      const pct = Math.round(num(p.progress) * 100);
+      if (state === 'done') {
+        const images = Array.isArray(p.images) ? p.images : [];
+        const tile = images.length ? normalizeTile(images[0], shot.seed) : null;
+        if (tile && tile.url) {
+          const img = document.createElement('img');
+          img.loading = 'lazy';
+          img.alt = String(shot.label || '序列出图');
+          img.src = tile.url;
+          if (ui.ph.parentNode) ui.ph.parentNode.replaceChild(img, ui.ph);
+          ui.card.dataset.url = tile.url;
+          if (!ui.card.dataset.seed) ui.card.dataset.seed = String(shot.seed != null ? shot.seed : '');
+          updateSeqCount();
+          ui.meta.textContent = 'seed ' + (shot.seed != null ? shot.seed : '—') + ' · 完成';
+        } else {
+          ui.ph.textContent = '完成但无图';
+        }
+        return;
+      }
+      if (state === 'error') {
+        ui.ph.textContent = '失败：' + (p.error || '未知错误');
+        return;
+      }
+      ui.ph.textContent = state === 'queued' ? '排队中…' : '生成中 ' + pct + '%';
+      ui.meta.textContent = 'seed ' + (shot.seed != null ? shot.seed : '—') + ' · ' + pct + '%';
+      seqTimers.push(setTimeout(tick, 700));
+    } catch (err) {
+      ui.meta.textContent = '轮询失败：' + err.message;
+      seqTimers.push(setTimeout(tick, 1600));
+    }
+  };
+  seqTimers.push(setTimeout(tick, 700));
+}
+
+async function runSequence() {
+  if (seqRunning) return;
+  const sel = $('seq_select');
+  const name = sel ? sel.value : '';
+  if (!name) {
+    setStatus('还没有可选序列（GET /api/sequences）', 'err');
+    return;
+  }
+  seqRunning = true;
+  const btn = $('seq_run');
+  if (btn) { btn.disabled = true; btn.textContent = '提交中…'; }
+  clearSeqTimers();
+  const strip = $('seq_strip');
+  if (strip) strip.textContent = '';
+  updateSeqCount();
+
+  try {
+    const sameSeedEl = $('seq_same_seed');
+    const body = {
+      name: name,
+      base: Object.assign({}, cameraPayload(), genPayload()),
+      same_seed: sameSeedEl ? !!sameSeedEl.checked : true,
+      seed: Math.trunc(num(S.seed, -1)),
+      randomize: !!S.randomize,
+    };
+    const data = await postJSON(API.sequence, body);
+    const shots = (data && Array.isArray(data.shots)) ? data.shots : [];
+    shots.forEach((shot) => {
+      const ui = addSeqCard(shot);
+      pollSeqShot(shot, ui);
+    });
+    const failed = data && data.failed_label ? ' · 中断于 ' + data.failed_label : '';
+    setStatus('序列「' + name + '」已提交 ' + shots.length + ' 张' + failed, shots.length ? 'ok' : 'err');
+  } catch (err) {
+    setStatus('序列提交失败：' + err.message, 'err');
+  } finally {
+    seqRunning = false;
+    if (btn) { btn.disabled = false; btn.textContent = '运行序列'; }
   }
 }
 
@@ -840,6 +1234,35 @@ function bindCameraInputs() {
     });
   });
 
+  const focalEl = $('focal');
+  if (focalEl) {
+    focalEl.addEventListener('input', () => {
+      if (syncing) return;
+      S.focal = clamp(num(focalEl.value, 50), 14, 200);
+      refreshReadouts();
+      markCustom();
+      pushRig();
+      schedulePreview();
+      scheduleConfigSave();
+    });
+  }
+
+  const chipRow = $('btn_focal_preset');
+  if (chipRow) {
+    chipRow.addEventListener('click', (e) => {
+      const b = e.target.closest ? e.target.closest('.chip') : null;
+      if (!b) return;
+      const f = Math.round(num(b.dataset.focal, 50));
+      if (FOCAL_STOPS.indexOf(f) < 0) return;
+      S.focal = f;
+      writeCameraUI();
+      pushRig();
+      markCustom();
+      schedulePreview();
+      scheduleConfigSave();
+    });
+  }
+
   ['strength', 'neg_strength'].forEach((k) => {
     const el = $(k);
     if (!el) return;
@@ -853,17 +1276,45 @@ function bindCameraInputs() {
     });
   });
 
-  ['weight_mode', 'azimuth_mode', 'elevation_mode'].forEach((k) => {
+  ['weight_mode', 'azimuth_mode', 'elevation_mode', 'gaze_mode'].forEach((k) => {
     const el = $(k);
     if (!el) return;
     el.addEventListener('change', () => {
       if (syncing) return;
       S[k] = el.value;
+      refreshReadouts();
       markCustom();
+      pushRig();
       schedulePreview();
       scheduleConfigSave();
     });
   });
+
+  const refFile = $('ref_file');
+  if (refFile) {
+    refFile.addEventListener('change', () => {
+      const file = refFile.files && refFile.files[0];
+      if (!file) {
+        if (rig) rig.setRefImage('');
+        return;
+      }
+      const url = URL.createObjectURL(file);
+      if (rig) {
+        rig.setRefImage(url);
+        rig.setRefOpacity(S.ref_opacity);
+      }
+      setStatus('参考图叠层已载入：' + file.name + '（仅内存，不写 localStorage）', 'ok');
+    });
+  }
+
+  const refOp = $('ref_opacity');
+  if (refOp) {
+    refOp.addEventListener('input', () => {
+      S.ref_opacity = clamp(num(refOp.value, 0.35), 0, 1);
+      refreshReadouts();
+      if (rig) rig.setRefOpacity(S.ref_opacity);
+    });
+  }
 }
 
 function bindTextInputs() {
@@ -921,8 +1372,66 @@ function bindButtons() {
   const save = $('btn_save_preset');
   if (save) save.addEventListener('click', onSavePreset);
 
+  const exp = $('btn_export_presets');
+  if (exp) exp.addEventListener('click', exportPresets);
+
+  const imp = $('btn_import_presets');
+  if (imp) {
+    imp.addEventListener('click', () => {
+      const file = $('import_file');
+      if (file) file.click();
+    });
+  }
+
+  const impFile = $('import_file');
+  if (impFile) {
+    impFile.addEventListener('change', () => {
+      const file = impFile.files && impFile.files[0];
+      importPresets(file);
+      impFile.value = '';
+    });
+  }
+
   const reset = $('btn_reset');
   if (reset) reset.addEventListener('click', resetAll);
+
+  const hud = $('btn_hud_toggle');
+  if (hud) {
+    hud.addEventListener('click', () => {
+      const vp = $('viewport');
+      if (!vp) return;
+      const off = vp.classList.toggle('hud-off');
+      hud.classList.toggle('on', !off);
+      if (rig) rig.toggleGrid(!off);
+    });
+  }
+
+  const seqBtn = $('btn_seq');
+  if (seqBtn) {
+    seqBtn.addEventListener('click', () => {
+      const panel = $('seq_panel');
+      if (!panel) return;
+      const open = panel.classList.toggle('open');
+      seqBtn.classList.toggle('on', open);
+    });
+  }
+
+  const seqSel = $('seq_select');
+  if (seqSel) seqSel.addEventListener('change', updateSeqDesc);
+
+  const seqRun = $('seq_run');
+  if (seqRun) seqRun.addEventListener('click', runSequence);
+
+  const strip = $('seq_strip');
+  if (strip) {
+    strip.addEventListener('click', (e) => {
+      const card = e.target.closest ? e.target.closest('.seq-card') : null;
+      if (!card || !card.dataset.url) return;
+      const list = seqUrls();
+      const idx = list.findIndex((x) => x.url === card.dataset.url);
+      openLightbox(idx < 0 ? 0 : idx, list);
+    });
+  }
 
   const folder = $('btn_open_folder');
   if (folder) {
@@ -995,7 +1504,30 @@ function bindButtons() {
   }
 }
 
+/** R 键复位（1..6/G/F 在 camera3d.js 里） */
+function bindShortcutReset() {
+  document.addEventListener('keydown', (e) => {
+    if (e.ctrlKey || e.metaKey || e.altKey) return;
+    const t = e.target;
+    const tag = t && t.tagName ? String(t.tagName).toUpperCase() : '';
+    if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || (t && t.isContentEditable)) return;
+    if (e.key === 'r' || e.key === 'R') {
+      resetAll();
+      e.preventDefault();
+    }
+  });
+}
+
 // ─────────────────────────── 启动 ───────────────────────────
+
+async function loadSequences() {
+  try {
+    const data = await api(API.sequences);
+    fillSeqSelect(data);
+  } catch (_) {
+    fillSeqSelect(null);
+  }
+}
 
 async function init() {
   const canvas = $('view3d');
@@ -1013,6 +1545,7 @@ async function init() {
   bindGenInputs();
   bindButtons();
   bindLightbox();
+  bindShortcutReset();
 
   const results = await Promise.allSettled([
     api(API.meta),
@@ -1036,6 +1569,10 @@ async function init() {
   writeCameraUI();
   syncGenUI();
   pushRig();
+  if (rig) {
+    rig.setRefOpacity(S.ref_opacity);
+    rig.toggleGrid(true);
+  }
 
   if (modelsRes.status === 'fulfilled') {
     applyModels(modelsRes.value);
@@ -1071,6 +1608,8 @@ async function init() {
   } else {
     loadGallery([]);
   }
+
+  loadSequences();
 
   if (rig) rig.resize();
 

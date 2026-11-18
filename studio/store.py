@@ -36,6 +36,11 @@ DEFAULT_CONFIG = {
     "pos_y": 0.0,
     "pos_z": 0.0,
     "roll": 0.0,
+    "focal": 50.0,
+    "pan_x": 0.0,
+    "pan_y": 0.0,
+    "subject_yaw": 0.0,
+    "gaze_mode": "auto",
     "preset": "自定义",
     "strength": 1.0,
     "weight_mode": "tanh",
@@ -185,29 +190,84 @@ def update_config(patch):
 
 
 # ══════════════════════ UI 预设 ══════════════════════
-def _coerce_vals(vals):
-    """[x, y, z, roll] → 4 个 float；不合法返回 None。"""
-    if not isinstance(vals, (list, tuple)) or len(vals) < 4:
-        return None
-    out = []
-    for v in list(vals)[:4]:
-        try:
-            out.append(round(float(v), 4))
-        except (TypeError, ValueError):
+# v2：用户预设从一个 4 元组扩展成「当前全部相机参数」。
+# 旧文件里的 [pos_x, pos_y, pos_z, roll] 读时自动补齐下面这份默认，不改用户盘上数据。
+PRESET_SCHEMA = {
+    "pos_x": 0.0,
+    "pos_y": 0.0,
+    "pos_z": 0.0,
+    "roll": 0.0,
+    "focal": 50.0,
+    "pan_x": 0.0,
+    "pan_y": 0.0,
+    "subject_yaw": 0.0,
+    "gaze_mode": "auto",
+    "preset": "自定义",
+    "strength": 1.0,
+    "weight_mode": "tanh",
+    "azimuth_mode": "8bin",
+    "elevation_mode": "3bin",
+    "neg_strength": 1.0,
+    "extra_positive": "",
+    "extra_negative": "",
+}
+
+PRESET_KEYS = tuple(PRESET_SCHEMA.keys())
+LEGACY_PRESET_KEYS = ("pos_x", "pos_y", "pos_z", "roll")
+PRESET_NAME_MAX = 40
+
+
+def _coerce_preset(value):
+    """dict 或旧式 [x, y, z, roll] → 补齐 v2 默认的完整参数 dict；不合法返回 None。"""
+    if isinstance(value, (list, tuple)):
+        if len(value) < 4:
             return None
-    return out
+        out = dict(PRESET_SCHEMA)
+        for key, raw in zip(LEGACY_PRESET_KEYS, list(value)[:4]):
+            try:
+                out[key] = round(float(raw), 4)
+            except (TypeError, ValueError):
+                return None
+        return out
+    if not isinstance(value, dict):
+        return None
+    out = dict(PRESET_SCHEMA)
+    touched = False
+    for key, default in PRESET_SCHEMA.items():
+        if key not in value or value[key] is None:
+            continue
+        raw = value[key]
+        if isinstance(default, bool):
+            out[key] = _as_bool(raw)
+        elif isinstance(default, (int, float)):
+            try:
+                out[key] = round(float(raw), 4)
+            except (TypeError, ValueError):
+                continue
+        else:
+            out[key] = str(raw)[:200]
+        touched = True
+    return out if touched else None
+
+
+def _coerce_vals(vals):
+    """兼容层：旧调用点拿到的是 [x, y, z, roll]（4 个 float）或 None。"""
+    cv = _coerce_preset(vals)
+    if cv is None:
+        return None
+    return [cv[key] for key in LEGACY_PRESET_KEYS]
 
 
 def load_presets():
-    """{名字: [pos_x, pos_y, pos_z, roll]}"""
+    """{名字: 完整参数 dict}（旧式 4 元组读时补齐默认值）。"""
     raw = read_json(PRESETS_PATH, {})
     out = {}
     if isinstance(raw, dict):
         for name, vals in raw.items():
-            name = str(name).strip()[:40]
+            name = str(name).strip()[:PRESET_NAME_MAX]
             if not name:
                 continue
-            cv = _coerce_vals(vals)
+            cv = _coerce_preset(vals)
             if cv is not None:
                 out[name] = cv
     return out
@@ -217,8 +277,8 @@ def save_presets(presets):
     data = {}
     if isinstance(presets, dict):
         for name, vals in presets.items():
-            name = str(name).strip()[:40]
-            cv = _coerce_vals(vals)
+            name = str(name).strip()[:PRESET_NAME_MAX]
+            cv = _coerce_preset(vals)
             if name and cv is not None:
                 data[name] = cv
     ensure_dirs()
@@ -227,16 +287,53 @@ def save_presets(presets):
 
 
 def set_ui_preset(name, vals):
-    """新增/覆盖一个用户预设；返回 (ok, 全量预设 或 错误串)。"""
-    name = str(name or "").strip()[:40]
+    """新增/覆盖一个用户预设（vals 可以是 dict，也可以是旧式 4 元组）；返回 (ok, 全量预设 或 错误串)。"""
+    name = str(name or "").strip()[:PRESET_NAME_MAX]
     if not name:
         return False, "name 不能为空"
-    cv = _coerce_vals(vals)
+    cv = _coerce_preset(vals)
     if cv is None:
-        return False, "vals 必须是 4 个数字 [pos_x, pos_y, pos_z, roll]"
+        return False, "vals 必须是参数字典，或旧式 4 个数字 [pos_x, pos_y, pos_z, roll]"
     presets = load_presets()
     presets[name] = cv
     return True, save_presets(presets)
+
+
+def export_presets(presets=None):
+    """导出体 {"version": 2, "presets": {名字: dict}}；给了 presets 就完全不碰磁盘。"""
+    data = load_presets() if presets is None else presets
+    clean = {}
+    if isinstance(data, dict):
+        for name, vals in data.items():
+            key = str(name).strip()[:PRESET_NAME_MAX]
+            cv = _coerce_preset(vals)
+            if key and cv is not None:
+                clean[key] = cv
+    return {"version": 2, "presets": clean}
+
+
+def import_presets(payload, persist=True):
+    """合并导入：接受 {"presets": {...}} / {"version": 2, "presets": {...}} / 裸 {名字: 参数}。
+
+    返回 (added, 合并后的全量预设)。persist=False 时只算不写盘（纯函数，便于单测）。
+    """
+    data = payload
+    if isinstance(payload, dict) and isinstance(payload.get("presets"), dict):
+        data = payload["presets"]
+    if not isinstance(data, dict):
+        return 0, load_presets()
+    presets = load_presets()
+    added = 0
+    for name, vals in data.items():
+        key = str(name).strip()[:PRESET_NAME_MAX]
+        cv = _coerce_preset(vals)
+        if not key or cv is None:
+            continue
+        presets[key] = cv
+        added += 1
+    if not persist:
+        return added, presets
+    return added, save_presets(presets)
 
 
 def delete_ui_preset(name):
@@ -361,7 +458,9 @@ __all__ = [
     "IMAGE_EXTS", "DEFAULT_CONFIG",
     "ensure_dirs", "atomic_write_json", "read_json",
     "load_config", "save_config", "update_config",
+    "PRESET_SCHEMA", "PRESET_KEYS", "PRESET_NAME_MAX",
     "load_presets", "save_presets", "set_ui_preset", "delete_ui_preset",
+    "export_presets", "import_presets",
     "unique_output_path", "out_rel", "write_meta", "read_meta",
     "list_gallery", "clear_gallery", "meta_path", "now",
 ]

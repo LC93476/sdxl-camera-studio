@@ -7,7 +7,7 @@
 <link rel="icon" href="data:," />
 <link rel="stylesheet" href="/styles.css" />
 <script type="importmap">
-{"imports":{"three":"/vendor/three.module.js"}}
+{"imports":{"three":"/js/three.module.js"}}
 </script>
 </head>
 <body>
@@ -28,7 +28,10 @@
         <span>预设</span>
         <select id="preset" title="选择预设机位"></select>
       </label>
-      <button id="btn_save_preset" class="btn ghost" title="把当前机位保存为预设">保存预设</button>
+      <button id="btn_save_preset" class="btn ghost" title="把当前全部 v2 机位参数保存为预设">保存预设</button>
+      <button id="btn_export_presets" class="btn ghost" title="导出全部用户预设为 JSON 文件">导出预设</button>
+      <button id="btn_import_presets" class="btn ghost" title="从 JSON 文件导入用户预设">导入预设</button>
+      <input type="file" id="import_file" accept="application/json,.json" hidden />
       <button id="btn_reset" class="btn ghost" title="恢复默认机位与参数">复位</button>
       <button id="btn_open_folder" class="btn ghost" title="在资源管理器打开输出目录">输出目录</button>
     </div>
@@ -37,9 +40,27 @@
   <main class="layout">
 
     <section class="pane pane-left">
-      <div class="viewport">
+      <div class="viewport" id="viewport">
         <canvas id="view3d"></canvas>
-        <div class="vp-tip">左键拖 = 旋转场景 · Shift/右键拖 = 平移 · 拖粉点改方位 · 拖青点改高度 · 滚轮改距离</div>
+
+        <img id="ref_overlay" class="ref-overlay" alt="参考图叠层" hidden />
+        <div id="grid_overlay" class="grid-overlay" aria-hidden="true">
+          <span class="gl gl-v1"></span>
+          <span class="gl gl-v2"></span>
+          <span class="gl gl-h1"></span>
+          <span class="gl gl-h2"></span>
+          <span class="gl gl-hz"></span>
+        </div>
+
+        <div class="hud">
+          <span class="hud-chip" id="hud_lens">50mm · 39.6°</span>
+          <span class="hud-chip" id="hud_pose">正面 · 平视</span>
+          <span class="hud-chip hud-framing" id="framing_hint">居中构图</span>
+        </div>
+        <button id="btn_hud_toggle" class="btn mini hud-btn" title="显示/隐藏 HUD 与九宫格（G）">HUD</button>
+
+        <div class="vp-tip">左键拖 = 旋转场景 · Shift/右键拖 = 平移 · 拖粉点改方位 · 拖青点改高度 · 滚轮改距离<br />
+          快捷键 1 正面 · 2 背面 · 3 左正侧 · 4 右正侧 · 5 高角度 · 6 低角度 · R 复位 · G 九宫格 · F 视锥</div>
       </div>
 
       <div class="sliderbar">
@@ -70,6 +91,39 @@
             <span class="val" id="vr" data-val="roll">0.000</span>
           </div>
 
+          <div class="srow focal-val">
+            <label for="focal">焦段 focal</label>
+            <input type="range" id="focal" min="14" max="200" step="1" value="50" />
+            <span class="val" id="focal_label">50mm · 39.6°</span>
+          </div>
+          <div class="srow wide focal-row">
+            <label>焦段档</label>
+            <div id="btn_focal_preset" class="chip-row">
+              <button type="button" class="chip" data-focal="14">14</button>
+              <button type="button" class="chip" data-focal="24">24</button>
+              <button type="button" class="chip" data-focal="35">35</button>
+              <button type="button" class="chip" data-focal="50">50</button>
+              <button type="button" class="chip" data-focal="85">85</button>
+              <button type="button" class="chip" data-focal="135">135</button>
+            </div>
+          </div>
+
+          <div class="srow">
+            <label for="pan_x">构图偏移 pan_x</label>
+            <input type="range" id="pan_x" min="-1" max="1" step="0.01" value="0" />
+            <span class="val" data-val="pan_x">0.000</span>
+          </div>
+          <div class="srow">
+            <label for="pan_y">构图偏移 pan_y</label>
+            <input type="range" id="pan_y" min="-1" max="1" step="0.01" value="0" />
+            <span class="val" data-val="pan_y">0.000</span>
+          </div>
+          <div class="srow">
+            <label for="subject_yaw" title="subject_yaw：主体自身朝向，0 正面、±1 完全背身">主体朝向</label>
+            <input type="range" id="subject_yaw" min="-1" max="1" step="0.01" value="0" />
+            <span class="val" data-val="subject_yaw">0.000</span>
+          </div>
+
           <div class="srow">
             <label for="strength">强度 strength</label>
             <input type="range" id="strength" min="0" max="2" step="0.01" value="1" />
@@ -96,6 +150,11 @@
             <select id="elevation_mode" data-enum="elevation_mode"></select>
             <span class="val ghost"></span>
           </div>
+          <div class="srow sel">
+            <label for="gaze_mode">视线 gaze_mode</label>
+            <select id="gaze_mode" data-enum="gaze_mode"></select>
+            <span class="val ghost"></span>
+          </div>
 
           <div class="srow wide">
             <label for="extra_positive">额外正向词</label>
@@ -104,6 +163,16 @@
           <div class="srow wide">
             <label for="extra_negative">额外负向词</label>
             <input type="text" id="extra_negative" placeholder="拼进负向提示词末尾，如 blurry, watermark" />
+          </div>
+
+          <div class="srow wide">
+            <label for="ref_file">参考图</label>
+            <input type="file" id="ref_file" accept="image/*" title="本地选图做半透明叠层，不上传、不写 localStorage" />
+          </div>
+          <div class="srow">
+            <label for="ref_opacity">叠层透明度</label>
+            <input type="range" id="ref_opacity" min="0" max="1" step="0.01" value="0.35" />
+            <span class="val" data-val="ref_opacity">0.35</span>
           </div>
         </div>
       </div>
@@ -125,6 +194,13 @@
         <div class="info-row">
           <span id="info_out" class="info">—</span>
           <span id="token_badge" class="badge">P 0 · N 0</span>
+        </div>
+        <div class="token-panel">
+          <div class="card-head sub">
+            <h2>Token 预算</h2>
+            <span id="token_total" class="badge soft">总 0</span>
+          </div>
+          <div id="token_parts" class="token-parts"></div>
         </div>
       </div>
 
@@ -206,6 +282,31 @@
         </div>
         <progress id="progressbar" max="100" value="0"></progress>
         <div id="status" class="status">就绪</div>
+      </div>
+
+      <div class="card">
+        <div class="card-head">
+          <h2>序列对比</h2>
+          <div class="head-actions">
+            <span class="badge soft" data-badge="seq-count">0 张</span>
+            <button id="btn_seq" class="btn mini" title="展开 / 收起序列面板">序列</button>
+          </div>
+        </div>
+        <div id="seq_panel" class="seq-panel open">
+          <div class="seq-controls">
+            <label class="field-inline grow">
+              <span>序列</span>
+              <select id="seq_select"></select>
+            </label>
+            <label class="field-inline chk">
+              <span>same seed</span>
+              <input type="checkbox" id="seq_same_seed" checked />
+            </label>
+            <button id="seq_run" class="btn mini primary">运行序列</button>
+          </div>
+          <div class="seq-desc" id="seq_desc"></div>
+          <div id="seq_strip" class="seq-strip"></div>
+        </div>
       </div>
 
       <div class="card">

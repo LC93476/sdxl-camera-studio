@@ -132,6 +132,7 @@ def main():
     ap.add_argument("--height", type=int, default=1216)
     ap.add_argument("--lora", type=float, default=0.8)
     ap.add_argument("--strength", type=float, default=1.0)
+    ap.add_argument("--focal", type=float, default=50.0)
     ap.add_argument("--limit", type=int, default=99)
     ap.add_argument("--tag", default="")
     ap.add_argument("--only", default="", help="只跑名字包含该子串的用例")
@@ -139,7 +140,8 @@ def main():
     os.makedirs(args.out, exist_ok=True)
     base = dict(preset="自定义", strength=args.strength, weight_mode="tanh", azimuth_mode="8bin",
                 elevation_mode="3bin", neg_strength=1.0, extra_positive=BASE_POS,
-                extra_negative=BASE_NEG, _cfg_json="{}", pos_x=0.0, pos_y=0.0, pos_z=0.0, roll=0.0)
+                extra_negative=BASE_NEG, _cfg_json="{}", pos_x=0.0, pos_y=0.0, pos_z=0.0, roll=0.0,
+                focal=args.focal, pan_x=0.0, pan_y=0.0, subject_yaw=0.0, gaze_mode="auto")
     cases = []
     if args.mode == "azimuth":
         for x in (-1.0, -0.75, -0.5, -0.25, 0.0, 0.25, 0.5, 0.75, 1.0):
@@ -153,6 +155,25 @@ def main():
     elif args.mode == "roll":
         for r in (0.0, 0.2, 0.4, 0.6, 0.8, 1.0):
             cases.append(("roll=%.1f" % r, dict(base, pos_x=0.0, roll=r)))
+    elif args.mode == "focal":
+        for f in (14, 24, 35, 50, 85, 135):
+            cases.append(("%dmm" % f, dict(base, focal=float(f))))
+    elif args.mode == "pan":
+        for px in (-0.5, -0.25, 0.0, 0.25, 0.5):
+            for py in (0.0, 0.35):
+                cases.append(("pan_x=%+.2f pan_y=%+.2f" % (px, py),
+                              dict(base, pan_x=px, pan_y=py)))
+    elif args.mode == "subject":
+        for yaw in (-0.9, -0.45, 0.0, 0.45, 0.9):
+            cases.append(("yaw=%+.2f 正面机位" % yaw, dict(base, subject_yaw=yaw)))
+        for yaw in (-0.45, 0.0):
+            cases.append(("yaw=%+.2f 背面机位" % yaw, dict(base, pos_x=1.0, subject_yaw=yaw)))
+    elif args.mode == "sequence":
+        from presets import get_sequence
+        for seq_name in ("三视图（正/45°/侧/背）", "推拉（特写→远景）"):
+            seq = get_sequence(seq_name)
+            for shot in (seq["shots"] if seq else []):
+                cases.append(("%s·%s" % (seq_name[:4], shot["label"]), dict(base, **shot["params"])))
     elif args.mode == "weight":
         for s in (0.0, 0.3, 0.6, 0.9, 1.2, 1.5, 2.0):
             cases.append(("strength=%.1f" % s, dict(base, pos_x=0.75, pos_y=0.35, strength=s)))
@@ -200,6 +221,8 @@ def main():
                                    preset=params["preset"], strength=params["strength"],
                                    weight_mode=params["weight_mode"], azimuth_mode=params["azimuth_mode"],
                                    elevation_mode=params["elevation_mode"], neg_strength=params["neg_strength"],
+                                   focal=params["focal"], pan_x=params["pan_x"], pan_y=params["pan_y"],
+                                   subject_yaw=params["subject_yaw"], gaze_mode=params["gaze_mode"],
                                    extra_positive="", extra_negative="")
                 sub = r["camera_info"].get("bin_line", "") or ""
                 with open(os.path.join(args.out, "prompts_%s.txt" % args.mode), "a", encoding="utf-8") as fh:

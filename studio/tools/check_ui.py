@@ -7,7 +7,7 @@
   2. app.js / camera3d.js 里 getElementById('x')、querySelector('#x')、querySelectorAll('#x')
      引用的 x 必须出现在 index.html 的 id 里；
   3. app.js 里所有 fetch('/api/...') 路径都在契约 HTTP API 清单里（允许 ?query 与模板拼接）；
-  4. index.html 有 importmap 指向 /vendor/three.module.js，且该文件存在且 > 1MB；
+  4. index.html 有 importmap 指向 /js/three.module.js，且该文件存在且 > 1MB（v2 复用仓库根）；
   5. app.js / camera3d.js 不出现 OrbitControls、不出现 CDN 外链（允许 import 'three'），
      并做一次括号配平（跳过字符串与注释）检查。
 
@@ -34,7 +34,9 @@ CONTRACT = os.path.join(STUDIO_DIR, "CONTRACT.md")
 INDEX = os.path.join(WEB_DIR, "index.html")
 APP_JS = os.path.join(WEB_DIR, "app.js")
 CAM_JS = os.path.join(WEB_DIR, "camera3d.js")
-THREE = os.path.join(WEB_DIR, "vendor", "three.module.js")
+ROOT = os.path.dirname(STUDIO_DIR)                       # 仓库根
+THREE = os.path.join(ROOT, "js", "three.module.js")     # v2：复用仓库根的三件套
+CAMSHARED = os.path.join(ROOT, "js", "camera_shared.js")
 STYLES = os.path.join(WEB_DIR, "styles.css")
 
 RESULTS = []
@@ -200,17 +202,23 @@ def contract_dom_ids(text):
 
 
 def contract_api_set(text):
-    m = re.search(r"##\s*HTTP API.*?(?=\n##\s|\Z)", text, re.S)
-    if not m:
+    """契约里所有 /api/... 路径（v2 起扫全文，不限 ## HTTP API 段）。
+
+    CONTRACT.md 的「v2 增补」段新增了 /api/sequences、/api/ui_presets/* 等，
+    只扫首段会漏，前端一写就误报「契约外路径」。
+    """
+    if not re.search(r"##\s*HTTP API", text):
         return None
-    return set(re.findall(r"/api/[A-Za-z0-9_/\-]+", m.group(0)))
+    paths = set(re.findall(r"/api/[A-Za-z0-9_/\-]+", text))
+    return paths or None
 
 
 # ------------------------------------------------------------ 检查 ---
 def check_files():
     name = "文件齐备"
     need = [(INDEX, "index.html"), (APP_JS, "app.js"), (CAM_JS, "camera3d.js"),
-            (STYLES, "styles.css"), (THREE, "vendor/three.module.js")]
+            (STYLES, "styles.css"), (THREE, "js/three.module.js"),
+            (CAMSHARED, "js/camera_shared.js")]
     missing = [label + "(" + p + ")" for p, label in need if not os.path.isfile(p)]
     if missing:
         return bad(name, "缺 " + "、".join(missing)), {}
@@ -335,7 +343,7 @@ def check_fetch_paths(js_files, apis):
 
 
 def check_importmap(html):
-    name = "importmap → /vendor/three.module.js（>1MB）"
+    name = "importmap → /js/three.module.js（>1MB）"
     m = re.search(r"<script[^>]*type\s*=\s*['\"]importmap['\"][^>]*>(.*?)</script>", html, re.S | re.I)
     if not m:
         return bad(name, "index.html 里没有 script type=importmap")
@@ -349,13 +357,13 @@ def check_importmap(html):
     three = imports.get("three")
     if not three:
         return bad(name, "importmap 没有 three 映射 → 实际 %s" % list(imports.keys()))
-    if not str(three).endswith("/vendor/three.module.js"):
-        return bad(name, "three 指向 %r（应指向 /vendor/three.module.js）" % (three,))
+    if not str(three).endswith("/js/three.module.js"):
+        return bad(name, "three 指向 %r（应指向 /js/three.module.js）" % (three,))
     if not os.path.isfile(THREE):
-        return bad(name, "vendor/three.module.js 不存在：%s" % THREE)
+        return bad(name, "js/three.module.js 不存在：%s" % THREE)
     size = os.path.getsize(THREE)
     if size <= 1024 * 1024:
-        return bad(name, "vendor/three.module.js 只有 %d 字节（要求 >1MB）" % size)
+        return bad(name, "js/three.module.js 只有 %d 字节（要求 >1MB）" % size)
     others = [k for k in imports if k != "three"]
     return ok(name, "three → %s，文件 %d 字节%s"
               % (three, size, ("，其它映射：" + ",".join(others)) if others else ""))

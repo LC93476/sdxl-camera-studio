@@ -1,13 +1,52 @@
 # -*- coding: utf-8 -*-
 """校验 litegraph 工作流 JSON：节点类型存在、连线索引合法、widgets_values 数量对得上。"""
-import json, sys, urllib.request
+import json, os, sys, urllib.request
 
 BASE = "http://127.0.0.1:8188"
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def local_specs():
+    """本仓库节点（nodes/*.py）的 INPUT_TYPES —— 服务器的 /object_info 可能还是旧的，
+    校验以源码为准，避免"改了 widget 顺序但校验照样过"。"""
+    import importlib.util
+    out = {}
+    nodes_dir = os.path.join(ROOT, "nodes")
+    core = os.path.join(ROOT, "core")
+    if core not in sys.path:
+        sys.path.insert(0, core)
+    if not os.path.isdir(nodes_dir):
+        return out
+    for fn in os.listdir(nodes_dir):
+        if not fn.endswith(".py") or fn.startswith("_"):
+            continue
+        spec = importlib.util.spec_from_file_location("_wfnode_" + fn[:-3], os.path.join(nodes_dir, fn))
+        mod = importlib.util.module_from_spec(spec)
+        try:
+            spec.loader.exec_module(mod)
+        except Exception as e:
+            print("warn: 载入 %s 失败 %s" % (fn, e))
+            continue
+        for attr in dir(mod):
+            cls = getattr(mod, attr)
+            if isinstance(cls, type) and hasattr(cls, "INPUT_TYPES"):
+                try:
+                    it = cls.INPUT_TYPES()
+                except Exception:
+                    continue
+                out[attr] = {"input": it, "output": list(getattr(cls, "RETURN_TYPES", ()))}
+    return out
 
 
 def main(path):
     wf = json.load(open(path, encoding="utf-8"))
-    oi = json.load(urllib.request.urlopen(BASE + "/object_info", timeout=120))
+    local = local_specs()
+    try:
+        oi = json.load(urllib.request.urlopen(BASE + "/object_info", timeout=120))
+    except Exception as e:
+        print("warn: 服务器 /object_info 取不到（%s），只用本地节点定义" % e)
+        oi = {}
+    oi.update(local)   # 源码优先
     nodes = {n["id"]: n for n in wf["nodes"]}
     links = {l[0]: l for l in wf["links"]}
     bad = []

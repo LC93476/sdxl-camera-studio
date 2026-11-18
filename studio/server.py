@@ -15,6 +15,7 @@
 
 import argparse
 import json
+import math
 import os
 import pathlib
 import random
@@ -30,14 +31,23 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 CORE_DIR = os.path.join(ROOT, "core")
-for _p in (CORE_DIR, HERE):
+TOOLS_DIR = os.path.join(ROOT, "tools")
+JS_DIR = os.path.join(ROOT, "js")
+for _p in (CORE_DIR, HERE, TOOLS_DIR):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
 import comfy_bridge  # noqa: E402
 import store  # noqa: E402
 from camera_core import AZ_BINS, DIST_KEYS, EL_KEYS, compute_camera, default_tags  # noqa: E402
-from presets import PRESETS, PRESET_MODES, PRESET_NAMES  # noqa: E402
+from presets import (  # noqa: E402
+    PRESETS, PRESET_MODES, PRESET_NAMES, get_sequence, preset_params, sequence_names,
+)
+
+try:  # 真分词器 / 估算都封在 tools/token_count.py；缺文件也不能让服务起不来
+    import token_count  # noqa: E402
+except Exception:  # noqa: BLE001
+    token_count = None
 
 VERSION = "1.0"
 MAX_BODY = 4 * 1024 * 1024
@@ -47,7 +57,13 @@ CAM_KEYS = (
     "pos_x", "pos_y", "pos_z", "roll", "preset", "strength",
     "weight_mode", "azimuth_mode", "elevation_mode", "neg_strength",
     "extra_positive", "extra_negative",
+    # v2：光学 / 构图平移 / 主体朝向
+    "focal", "pan_x", "pan_y", "subject_yaw", "gaze_mode",
 )
+
+# v2 枚举（/api/meta 下发，前端下拉框用）
+FOCALS = [14, 24, 35, 50, 85, 135]
+GAZE_MODES = ["auto", "camera", "away"]
 
 DEFAULT_ENUMS = {
     "weight_mode": ["tanh", "linear", "raw"],
@@ -134,13 +150,18 @@ def _resolve_under(root, rel):
 
 
 def _cam_params(body, base=None):
-    """把请求体和配置合并成 compute_camera 的参数。"""
+    """把请求体和配置合并成 compute_camera 的参数。
+
+    v2：preset 不是「自定义」且是已知预设时，用 presets.preset_params() 整份覆盖
+    相机参数（含 focal / pan / subject_yaw / gaze_mode 与 elevation_mode / strength）。
+    未知预设不覆盖，交给 build_preview 给 warn。
+    """
     src = dict(base or {})
     if isinstance(body, dict):
         for key in CAM_KEYS:
             if body.get(key) is not None:
                 src[key] = body[key]
-    return {
+    params = {
         "pos_x": _num(src.get("pos_x"), 0.0),
         "pos_y": _num(src.get("pos_y"), 0.0),
         "pos_z": _num(src.get("pos_z"), 0.0),
@@ -153,7 +174,23 @@ def _cam_params(body, base=None):
         "neg_strength": _num(src.get("neg_strength"), 1.0),
         "extra_positive": str(src.get("extra_positive") or ""),
         "extra_negative": str(src.get("extra_negative") or ""),
+        "focal": _num(src.get("focal"), 50.0),
+        "pan_x": _num(src.get("pan_x"), 0.0),
+        "pan_y": _num(src.get("pan_y"), 0.0),
+        "subject_yaw": _num(src.get("subject_yaw"), 0.0),
+        "gaze_mode": str(src.get("gaze_mode") or "auto"),
     }
+    preset = params["preset"]
+    if preset != "自定义" and preset in PRESETS:
+        over = preset_params(preset)
+        for key in ("pos_x", "pos_y", "pos_z", "roll", "focal", "pan_x", "pan_y",
+                    "subject_yaw", "strength", "neg_strength"):
+            if key in over:
+                params[key] = _num(over[key], params[key])
+        for key in ("gaze_mode", "weight_mode", "azimuth_mode", "elevation_mode"):
+            if key in over:
+                params[key] = str(over[key])
+    return params
 
 
 def _append_manual(base, extra):
@@ -166,6 +203,89 @@ def _append_manual(base, extra):
     return base + ", " + extra
 
 
+# ══════════════════ token 计数（真分词器缺失时退化为估算） ══════════════════
+def _fallback_tag_tokens(tag):
+    """估算单 tag：去权重文本按 3.6 字符/token 向上取整，加权 tag 额外 +3。"""
+    text = str(tag or "").strip()
+    if not text:
+        return 0
+    extra = 0
+    if text.startswith("(") and text.endswith(")") and ":" in text:
+        head, _sep, tail = text[1:-1].rpartition(":")
+        try:
+            float(tail)
+        except ValueError:
+            pass
+        else:
+            text = head.strip()
+            extra = 3
+    if not text:
+        return extra
+    return int(math.ceil(len(text) / 3.6)) + extra
+
+
+def _fallback_count(text):
+    total = 0
+    for tag in str(text or "").replace("\n", ",").split(","):
+        total += _fallback_tag_tokens(tag)
+    return total
+
+
+def _fallback_fragments(parts):
+    out = []
+    for part in parts or []:
+        if not isinstance(part, dict):
+            continue
+        for tag in str(part.get("phrase") or "").replace("\n", ",").split(","):
+            if not tag.strip():
+                continue
+            out.append({
+                "kind": str(part.get("kind") or ""),
+                "key": str(part.get("key") or ""),
+                "text": tag.strip(),
+                "tokens": _fallback_tag_tokens(tag),
+            })
+    return out
+
+
+def _tok_count(text):
+    if token_count is not None:
+        try:
+            return int(token_count.count(text))
+        except BaseException:  # noqa: BLE001 - 计数失败只是退化，不允许影响路由
+            pass
+    return _fallback_count(text)
+
+
+def _tok_count_tags(tags):
+    if token_count is not None:
+        try:
+            return int(token_count.count_tags(tags))
+        except BaseException:  # noqa: BLE001
+            pass
+    return sum(_fallback_tag_tokens(t) for t in (tags or []))
+
+
+def _tok_method():
+    if token_count is not None:
+        try:
+            return str(token_count.method())
+        except BaseException:  # noqa: BLE001
+            pass
+    return "estimate"
+
+
+def _tok_fragments(parts):
+    if token_count is not None:
+        try:
+            items = token_count.fragments(parts)
+            if isinstance(items, list):
+                return items
+        except BaseException:  # noqa: BLE001
+            pass
+    return _fallback_fragments(parts)
+
+
 def build_preview(body, base=None):
     """/api/preview 的全部逻辑；/api/generate 复用同一份结果（所见即所得）。"""
     body = body if isinstance(body, dict) else {}
@@ -175,27 +295,46 @@ def build_preview(body, base=None):
     positive = _append_manual(res.get("positive") or "", body.get("manual_positive") or "")
     negative = _append_manual(res.get("negative") or "", body.get("manual_negative") or "")
 
-    warn = ["tokens are estimated: round(len(text) / 3.6), not real tokenizer output"]
+    parts = res.get("parts") or []
+    token_parts = _tok_fragments(parts)
+    tok_pos = int(_tok_count(positive))
+    tok_neg = int(_tok_count(negative))
+    method = _tok_method()
+
+    warn = []
+    if method != "tokenizer":
+        warn.append(
+            "tokens are estimated (no CLIP tokenizer): strip-weight chars / 3.6 rounded up, +3 per weighted tag"
+        )
     preset = params["preset"]
-    modes = PRESET_MODES.get(preset) or {}
-    if modes:
+    if preset != "自定义" and preset in PRESETS:
+        over = preset_params(preset)
         bits = []
-        if "elevation_mode" in modes:
-            bits.append("elevation_mode=%s" % modes["elevation_mode"])
-        if "strength" in modes:
-            bits.append("strength=%.2f" % float(modes["strength"]))
-        warn.append("preset [%s] overrides %s" % (preset, ", ".join(bits)))
-    if preset != "自定义" and preset not in PRESETS:
+        for key in ("focal", "pan_x", "pan_y", "subject_yaw", "gaze_mode",
+                    "azimuth_mode", "elevation_mode", "strength", "weight_mode", "neg_strength"):
+            if key not in over:
+                continue
+            value = over[key]
+            if isinstance(value, float):
+                bits.append("%s=%g" % (key, value))
+            else:
+                bits.append("%s=%s" % (key, value))
+        if bits:
+            warn.append("preset [%s] overrides %s" % (preset, ", ".join(bits)))
+    elif preset != "自定义":
         warn.append("unknown preset [%s], sliders used as-is" % preset)
 
     return {
         "positive": positive,
         "negative": negative,
         "camera_info": res.get("camera_info") or {},
-        "parts": res.get("parts") or [],
+        "parts": parts,
+        "token_parts": token_parts,
         "tokens": {
-            "positive": int(round(len(positive) / 3.6)),
-            "negative": int(round(len(negative) / 3.6)),
+            "positive": tok_pos,
+            "negative": tok_neg,
+            "total": tok_pos + tok_neg,
+            "method": method,
         },
         "warn": warn,
         "params": params,
@@ -399,7 +538,45 @@ def api_meta():
         "enums": dict(DEFAULT_ENUMS),
         "vocab": vocab,
         "templates": api_templates().get("templates") or [],
+        # v2：光学 / 朝向枚举、序列清单（名字 → 说明）、仓库 js/ 资产
+        "focals": list(FOCALS),
+        "gaze_modes": list(GAZE_MODES),
+        "sequences": {
+            name: str((get_sequence(name) or {}).get("desc") or "")
+            for name in sequence_names()
+        },
+        "vendored": _js_assets(),
     }
+
+
+def _js_assets():
+    """仓库根 js/ 下的静态资产（前端据此判断 three.js / camera_shared.js 是否就位）。"""
+    out = {}
+    try:
+        names = sorted(os.listdir(JS_DIR))
+    except OSError:
+        return out
+    for name in names:
+        path = os.path.join(JS_DIR, name)
+        if not os.path.isfile(path):
+            continue
+        try:
+            out[name] = os.path.getsize(path)
+        except OSError:
+            out[name] = 0
+    return out
+
+
+def api_sequences():
+    """GET /api/sequences：完整序列定义（名字 → desc + shots）。"""
+    seqs = {}
+    for name in sequence_names():
+        seq = get_sequence(name) or {}
+        seqs[name] = {
+            "desc": str(seq.get("desc") or ""),
+            "shots": list(seq.get("shots") or []),
+        }
+    return {"ok": True, "names": list(seqs.keys()), "sequences": seqs}
 
 
 def api_templates():
@@ -447,12 +624,9 @@ def api_open_folder():
     return True, {"ok": True, "path": path}
 
 
-def api_generate(body):
-    """返回 (http_status, payload)。"""
+def _gen_params(body, cfg):
+    """采样 / 模型参数（/api/generate 与 /api/sequence 共用，避免两份真源）。"""
     body = body if isinstance(body, dict) else {}
-    cfg = store.load_config()
-    preview = build_preview(body, cfg)
-
     gen = {
         "checkpoint": str(body.get("checkpoint") or cfg.get("checkpoint") or "").strip(),
         "lora_name": str(body.get("lora_name") or body.get("lora") or cfg.get("lora_name") or "").strip(),
@@ -477,6 +651,15 @@ def api_generate(body):
     if gen["workflow_template"] and not gen["checkpoint"]:
         # 模板自带 checkpoint，不需要前端再选（缺了也只有内置图才必须）
         gen["checkpoint"] = ""
+    return gen
+
+
+def api_generate(body):
+    """返回 (http_status, payload)。"""
+    body = body if isinstance(body, dict) else {}
+    cfg = store.load_config()
+    preview = build_preview(body, cfg)
+    gen = _gen_params(body, cfg)
 
     if not gen["checkpoint"] and not gen["workflow_template"]:
         return 400, {
@@ -547,6 +730,121 @@ def api_generate(body):
         "batch": gen["batch"],
         "positive": preview["positive"],
         "negative": preview["negative"],
+    }
+
+
+def api_sequence(body):
+    """POST /api/sequence：按预设序列逐张 compute + submit；离线整单 503，绝不半提交。
+
+    先把所有机位的提示词和采样参数算完（不提交），再统一判在线、统一取 seed，
+    最后逐张 submit —— 任何一张失败都带着已提交的真实结果返回，不谎报全成功。
+    """
+    body = body if isinstance(body, dict) else {}
+    name = str(body.get("name") or "").strip()
+    seq = get_sequence(name)
+    if seq is None:
+        return 404, {"error": "unknown sequence: %s" % (name or "-"), "names": sequence_names()}
+    shots = list(seq.get("shots") or [])
+    if not shots:
+        return 400, {"error": "序列没有机位: %s" % name, "names": sequence_names()}
+
+    cfg = store.load_config()
+    base = body.get("base") if isinstance(body.get("base"), dict) else {}
+    same_seed = _truthy(body.get("same_seed", True))
+
+    plans = []
+    for shot in shots:
+        over = dict(base)
+        over.update(shot.get("params") or {})
+        preview = build_preview(over, cfg)
+        plans.append({
+            "label": str(shot.get("label") or ""),
+            "preview": preview,
+            "gen": _gen_params(over, cfg),
+        })
+
+    if not plans[0]["gen"]["checkpoint"] and not plans[0]["gen"]["workflow_template"]:
+        return 400, {
+            "error": "checkpoint 未选择：先 GET /api/comfy/models 取 checkpoints，再在 base 里带 checkpoint",
+            "hint": '例如 {"name": "环绕 8 机位", "base": {"checkpoint": "Illustrious-XL-v1.0.safetensors"}}',
+            "checkpoints": api_models().get("checkpoints") or [],
+        }
+
+    try:
+        seed_in = int(float(body.get("seed", base.get("seed", -1))))
+    except (TypeError, ValueError):
+        seed_in = -1
+    randomize = body.get("randomize")
+    randomize = (seed_in < 0) if randomize is None else _truthy(randomize)
+
+    if randomize or seed_in < 0:
+        first = random.randrange(0, 2 ** 31)
+        seeds = [first if same_seed else random.randrange(0, 2 ** 31) for _ in plans]
+        seed_source = "random"
+    else:
+        fixed = seed_in & 0xFFFFFFFF
+        seeds = [fixed if same_seed else (fixed + i) & 0xFFFFFFFF for i in range(len(plans))]
+        seed_source = "fixed"
+
+    # 在线判定放在任何 submit 之前：离线就是整单 503，一张都不进队列
+    if not BRIDGE.reachable():
+        return 503, {
+            "error": "ComfyUI 未启动，整单未提交",
+            "comfy_url": BRIDGE.base,
+            "name": name,
+            "same_seed": bool(same_seed),
+            "shots": [],
+        }
+
+    results = []
+    for idx, plan in enumerate(plans):
+        preview = plan["preview"]
+        gen = dict(plan["gen"])
+        gen["seed"] = seeds[idx]
+        try:
+            graph, graph_meta = BRIDGE.build_graph(gen, preview["positive"], preview["negative"])
+            prompt_id = BRIDGE.submit(graph)
+        except comfy_bridge.ComfyError as exc:
+            return 502, {
+                "error": str(exc),
+                "comfy_url": BRIDGE.base,
+                "name": name,
+                "same_seed": bool(same_seed),
+                "shots": results,
+                "failed_label": plan["label"],
+            }
+        with TASK_LOCK:
+            TASKS[prompt_id] = {
+                "prompt_id": prompt_id,
+                "t0": time.time(),
+                "steps": gen["steps"],
+                "seed": seeds[idx],
+                "seed_source": seed_source,
+                "images": None,
+                "gen": dict(gen),
+                "positive": preview["positive"],
+                "negative": preview["negative"],
+                "last_state": {"state": "queued", "progress": 0.0, "node": ""},
+            }
+            CURRENT["prompt_id"] = prompt_id
+            _trim_tasks()
+        results.append({
+            "label": plan["label"],
+            "prompt_id": prompt_id,
+            "seed": seeds[idx],
+            "positive": preview["positive"],
+            "negative": preview["negative"],
+            "params": preview["params"],
+            "template": str(graph_meta.get("template") or ""),
+            "warn": list(graph_meta.get("warn") or []),
+        })
+
+    return 200, {
+        "ok": True,
+        "name": name,
+        "desc": str(seq.get("desc") or ""),
+        "same_seed": bool(same_seed),
+        "shots": results,
     }
 
 
@@ -665,6 +963,10 @@ class StudioHandler(BaseHTTPRequestHandler):
                 return self._json(api_health())
             if path == "/api/meta":
                 return self._json(api_meta())
+            if path == "/api/sequences":
+                return self._json(api_sequences())
+            if path == "/api/ui_presets/export":
+                return self._export_presets()
             if path == "/api/comfy/models":
                 return self._json(api_models())
             if path == "/api/templates":
@@ -683,6 +985,8 @@ class StudioHandler(BaseHTTPRequestHandler):
                 return self._view(qs)
             if path.startswith("/api/"):
                 return self._err(404, "unknown endpoint: %s" % path)
+            if path == "/js" or path.startswith("/js/"):
+                return self._js(path)
             return self._static(path)
 
         if method == "POST":
@@ -711,6 +1015,12 @@ class StudioHandler(BaseHTTPRequestHandler):
                 if not ok:
                     return self._err(400, result)
                 return self._json({"ok": True, "name": name[:40], "ui_presets": result})
+            if path == "/api/ui_presets/import":
+                added, merged = store.import_presets(self._body())
+                return self._json({"ok": True, "added": int(added), "ui_presets": merged})
+            if path == "/api/sequence":
+                status, payload = api_sequence(self._body())
+                return self._json(payload, status)
             if path == "/api/open_folder":
                 _ok, payload = api_open_folder()
                 return self._json(payload, 200 if payload.get("ok") else 500)
@@ -758,6 +1068,36 @@ class StudioHandler(BaseHTTPRequestHandler):
             # 图要么在 ComfyUI 里、要么不在；离线也按「找不到」回 404，不抛 5xx
             return self._err(404, str(exc))
         return self._send(200, blob, _guess_mime(filename))
+
+    # ---------- /api/ui_presets/export ----------
+    def _export_presets(self):
+        raw = json.dumps(store.export_presets(), ensure_ascii=False, indent=2)
+        return self._send(
+            200,
+            raw,
+            "application/json; charset=utf-8",
+            {"Content-Disposition": 'attachment; filename="ui_presets.json"'},
+        )
+
+    # ---------- /js/*（仓库根 js/，防穿越） ----------
+    def _js(self, url_path):
+        rel = urllib.parse.unquote(url_path or "/js/")[len("/js"):].lstrip("/")
+        if not rel:
+            return self._err(404, "js file required: /js/<file>", js_dir=str(JS_DIR))
+        target = _resolve_under(JS_DIR, rel)
+        if not target:
+            return self._err(403, "forbidden path")
+        if not os.path.isfile(target):
+            return self._err(404, "js file not found: %s" % rel, js_dir=str(JS_DIR))
+        try:
+            with open(target, "rb") as fh:
+                blob = fh.read()
+        except OSError as exc:
+            return self._err(500, "cannot read %s: %s" % (rel, exc))
+        ctype = _guess_mime(target)
+        if pathlib.Path(target).suffix.lower() in (".js", ".mjs"):
+            ctype = "text/javascript; charset=utf-8"
+        return self._send(200, blob, ctype)
 
     # ---------- 静态 ----------
     def _static(self, url_path):
