@@ -39,7 +39,10 @@ for _p in (CORE_DIR, HERE, TOOLS_DIR):
 
 import comfy_bridge  # noqa: E402
 import store  # noqa: E402
-from camera_core import AZ_BINS, DIST_KEYS, EL_KEYS, compute_camera, default_tags  # noqa: E402
+from camera_core import (  # noqa: E402
+    AZ_BINS, DIST_KEYS, EL_KEYS, CLIP_TOK_LIMIT, CLIP_TOK_WARN, compute_camera, default_tags,
+    token_budget,
+)
 from presets import (  # noqa: E402
     PRESETS, PRESET_MODES, PRESET_NAMES, get_sequence, preset_params, sequence_names,
 )
@@ -334,6 +337,9 @@ def build_preview(body, base=None):
             "positive": tok_pos,
             "negative": tok_neg,
             "total": tok_pos + tok_neg,
+            "limit": CLIP_TOK_LIMIT,   # Chunk 0 上限（75）
+            "warn": CLIP_TOK_WARN,     # 到这儿标黄（65）
+            "level": token_budget(positive, negative)["level"],
             "method": method,
         },
         "warn": warn,
@@ -1006,7 +1012,16 @@ class StudioHandler(BaseHTTPRequestHandler):
                 return self._json({"ok": True, "cleared": store.clear_gallery()})
             if path == "/api/config":
                 body = self._body()
-                return self._json({"ok": True, "config": store.update_config(body)})
+                try:
+                    return self._json({"ok": True, "config": store.update_config(body)})
+                except OSError as exc:
+                    # 目录不可写（低完整性标签、只读盘）：回 200 + ok:false，
+                    # 前端把这句话显示出来，别抛 500 让界面看着像崩了。
+                    sys.stdout.write("[studio] config 落盘失败: %s" % exc)
+                    sys.stdout.write(chr(10))
+                    sys.stdout.flush()
+                    return self._json({"ok": False, "message": str(exc),
+                                       "config": store.load_config()}, 200)
             if path == "/api/ui_presets":
                 body = self._body()
                 name = str(body.get("name") or "").strip()

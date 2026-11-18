@@ -54,13 +54,14 @@ def check_v2(src):
     pairs = [("W_MIN_OUT", c.W_MIN_OUT), ("W_MAX_OUT", c.W_MAX_OUT),
              ("AZ_POLE", c.AZ_POLE), ("POLE_DEG", c.POLE_DEG),
              ("POLE_NORM", c.POLE_NORM), ("POLE_START", c.POLE_START),
+             ("POLE_LATCH", c.POLE_LATCH),
              ("AZ_SUPPRESS", c.AZ_SUPPRESS), ("BARE_EPS", c.BARE_EPS)]
     for name, pyv in pairs:
         jsv = _num(src, name)
         if jsv is None or abs(jsv - float(pyv)) > 1e-9:
             print("常量差异", name, "py:", pyv, "js:", jsv)
             bad += 1
-    print("[v2] 数值常量 %d 个（W_MIN_OUT/W_MAX_OUT/AZ_POLE/POLE_DEG/POLE_NORM/POLE_START/AZ_SUPPRESS/BARE_EPS）" % len(pairs))
+    print("[v2] 数值常量 %d 个（W_MIN_OUT/W_MAX_OUT/AZ_POLE/POLE_DEG/POLE_NORM/POLE_START/POLE_LATCH/AZ_SUPPRESS/BARE_EPS）" % len(pairs))
 
     # 2) 档位列表
     for name, pyv in (("AZ_BINS", c.AZ_BINS), ("EL_KEYS", c.EL_KEYS),
@@ -116,6 +117,24 @@ def check_v2(src):
                 print("POLE_GAZE 差异", k, "py:", py_pg.get(k), "js:", js_pg.get(k))
                 bad += 1
     print("[v2] POLE_GAZE %d 条（极点视线改写）" % len(py_pg))
+
+    # 4c) CLIP token 预算：阈值常量两边一致 + 两个实现都在
+    for name in ("CLIP_TOK_LIMIT", "CLIP_TOK_WARN"):
+        pyv = float(getattr(c, name))
+        m = re.search(r"export const " + name + r"\s*=\s*([0-9.]+)", src)
+        jsv = float(m.group(1)) if m else None
+        if jsv != pyv:
+            print("CLIP 阈值差异", name, "py:", pyv, "js:", jsv)
+            bad += 1
+    if not (hasattr(c, "clip_tokens") and hasattr(c, "token_budget")):
+        print("core 缺 clip_tokens / token_budget")
+        bad += 1
+    for fn in ("plainTags", "clipTokens", "budgetOf"):
+        if ("export function " + fn) not in src:
+            print("js/camera_shared.js 缺 export function", fn)
+            bad += 1
+    print("[v2] CLIP token 预算 %d/%d + clipTokens/budgetOf"
+          % (int(c.CLIP_TOK_WARN), int(c.CLIP_TOK_LIMIT)))
 
     # 5) 预设附加参数与模式
     from presets import PRESET_EXTRAS, PRESET_MODES

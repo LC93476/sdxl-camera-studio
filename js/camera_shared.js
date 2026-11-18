@@ -25,7 +25,12 @@ export const AZ_POLE = 0.9;
 export const POLE_DEG = 75.0;
 export const POLE_NORM = POLE_DEG / 90.0;
 export const POLE_START = 0.75;
+export const POLE_LATCH = 0.9;   // |pos_y| 超过这里就把 3bin 的 high/low 升级成 bird/worm
 export const AZ_SUPPRESS = 0.12;
+
+// CLIP token 预算：75 = Chunk 0 上限（77 减去起止符），65 起提示（= camera_core.py CLIP_TOK_LIMIT/WARN）
+export const CLIP_TOK_LIMIT = 75;
+export const CLIP_TOK_WARN = 65;
 
 // ── 档位定义 ────────────────────────────────────────────
 export const AZ_BINS = ["back", "back_left", "left", "front_left", "front", "front_right", "right", "back_right"];
@@ -61,8 +66,9 @@ const V = {
   high: "high angle shot, from above",
   eye: "eye level shot",
   low: "low angle shot, from below, looking up",
-  bird: "from above, high angle, looking down at viewer, top-down view",
-  worm: "from below, low angle, looking up at viewer",
+  // 极点高度：只描述机位（不含 "looking down/up at viewer"，视线交给 POLE_GAZE）
+  bird: "bird's-eye view, top-down view, aerial shot, from above",
+  worm: "worm's-eye view, extreme low angle, from below",
   // 距离
   ecu: "extreme close-up, macro shot",
   cu: "close-up, portrait shot",
@@ -108,8 +114,8 @@ const NEG = {
   high: "low angle shot, from below, looking up",
   low: "high angle shot, from above",
   eye: "high angle, low angle",
-  bird: "worm's-eye view, extreme low angle",
-  worm: "bird's-eye view, top-down shot",
+  bird: "worm's-eye view, extreme low angle, from below",
+  worm: "bird's-eye view, top-down view, from above",
   ecu: "wide shot, full body",
   cu: "wide shot, full body, distant",
   medium: "close-up, extreme close-up",
@@ -408,9 +414,20 @@ export function framingKeys(panX, panY) {
   return out;
 }
 
+/** 角度折半圈：1.0 = 180°，结果落在 [-1, 1)。 */
+export function wrapYaw(v) {
+  const c = clamp(v, -3, 3);
+  return ((c + 1) % 2 + 2) % 2 - 1;
+}
+
+/** 主体相对相机的偏航角：subjectYaw 与 posX 都是**世界坐标系**角度（1.0 = 180°）。 */
+export function relYaw(subjectYaw, posX) {
+  return wrapYaw(clamp(subjectYaw, -1, 1) - clamp(posX, -1, 1));
+}
+
 /** 主体朝向 / 视线（与机位解耦）→ [subjectKey, gazeKey, ratio]。 */
 export function subjectKeys(subjectYaw, posX, gazeMode) {
-  const yaw = clamp(subjectYaw, -1, 1);
+  const yaw = relYaw(subjectYaw, posX);
   const mag = Math.abs(yaw);
   let skey;
   let sratio;
@@ -492,11 +509,27 @@ export function resolveWeights(tags) {
  * 返回 {positive, negative, camera_info, info, parts, negative_parts, negativeParts, bins}
  */
 export function computeCamera(posX, posY, posZ, roll, opts) {
-  const o = opts || {};
-  const pz = clamp(posZ, -1, 1);
-  const py = clamp(posY, -1, 1);
-  const px = clamp(posX, -1, 1);
-  const rv = clamp(roll, -1, 1);
+  // ── 0. 预设覆盖：preset 非"自定义"时用预设的四轴 + 附加参数（与 camera_core.py 同序） ──
+  let ppx = posX, ppy = posY, ppz = posZ, ppr = roll;
+  let o = opts || {};
+  const presetName = String(o.preset || "自定义");
+  if (presetName && presetName !== "自定义" && PRESET_NAMES.indexOf(presetName) >= 0) {
+    const pp = presetParams(presetName);
+    if (pp) {
+      if (pp.pos_x != null) ppx = pp.pos_x;
+      if (pp.pos_y != null) ppy = pp.pos_y;
+      if (pp.pos_z != null) ppz = pp.pos_z;
+      if (pp.roll != null) ppr = pp.roll;
+      o = Object.assign({}, o);
+      ["focal", "pan_x", "pan_y", "subject_yaw", "gaze_mode"].forEach(k => {
+        if (pp[k] != null) o[k] = pp[k];
+      });
+    }
+  }
+  const pz = clamp(ppz, -1, 1);
+  const py = clamp(ppy, -1, 1);
+  const px = clamp(ppx, -1, 1);
+  const rv = clamp(ppr, -1, 1);
   const focal = clamp(o.focal == null ? 50.0 : o.focal, 4.0, 1200.0);
   const panX = clamp(o.pan_x == null ? 0.0 : o.pan_x, -1, 1);
   const panY = clamp(o.pan_y == null ? 0.0 : o.pan_y, -1, 1);
@@ -548,7 +581,11 @@ export function computeCamera(posX, posY, posZ, roll, opts) {
   }
 
   // ── 2. 高度 ──
-  const ekey = elevationKey(py, elMode);
+  let ekey = elevationKey(py, elMode);
+  // 极点锁存：3bin 到端点时升级成 bird/worm（与 core 同规则）
+  if (Math.abs(py) > POLE_LATCH && (ekey === "high" || ekey === "low")) {
+    ekey = py > 0 ? "bird" : "worm";
+  }
   const elCfg = weights.elevation;
   if (elCfg.enabled !== false) {
     let eraw = ekey === "eye" ? 1.0 : Math.abs(py) * Number(elCfg.mult == null ? 10.0 : elCfg.mult);
@@ -603,11 +640,18 @@ export function computeCamera(posX, posY, posZ, roll, opts) {
   const skey = sk[0];
   const gkey = sk[1];
   const sratio = sk[2];
+  const rel = relYaw(subjectYaw, px);
   let frontAz = 0.0;
-  azimuthBins(px).forEach(([key, ratio]) => { if (key === "front") frontAz = ratio; });
+  let behindAz = 0.0;
+  azimuthBins(px).forEach(([key, ratio]) => {
+    if (key === "front") frontAz = ratio;
+    else if (key === "back" || key === "back_left" || key === "back_right") behindAz += ratio;
+  });
   if (sCfg.enabled !== false) {
-    // 机位在正面且主体也正对时，"front-facing body" 与方位词重复，跳过
-    if (sratio > 0 && !(skey === "subject_front" && frontAz > 0.5)) {
+    // 去重两条：正面机位 + 主体正对 / 背面机位 + 主体背对，都是同一句话的两种写法
+    const dupFront = skey === "subject_front" && frontAz > 0.5;
+    const dupBack = skey === "subject_away" && behindAz > 0.45;
+    if (sratio > 0 && !dupFront && !dupBack) {
       const sraw = 1 + Number(sCfg.slope == null ? 2.0 : sCfg.slope) * (skey === "subject_front" ? 0.0 : sratio);
       push("subject", skey, sratio, sraw, sdxlWeight(sraw, strength, curve));
     }
@@ -689,7 +733,9 @@ export function computeCamera(posX, posY, posZ, roll, opts) {
     subject: skey,
     gaze: gkey,
     subject_yaw: r3(subjectYaw),
+    rel_yaw: r3(rel),
     pan: [r3(panX), r3(panY)],
+    tokens: budgetOf(positive, negative),
     preset: String(o.preset || "自定义"),
     strength: r3(strength),
     weight_mode: curve,
@@ -712,10 +758,64 @@ export function computeCamera(posX, posY, posZ, roll, opts) {
   };
 }
 
+// ══════════════════════ CLIP token 预算 ══════════════════════
+/** 去掉权重语法："(front view:1.40)" → "front view"（非权重的括号原样保留）。 */
+export function plainTags(text) {
+  const s = String(text == null ? "" : text);
+  let out = "";
+  let i = 0;
+  while (i < s.length) {
+    const ch = s[i];
+    if (ch === "(") {
+      const j = s.indexOf(")", i + 1);
+      if (j < 0) { out += s.slice(i + 1); break; }
+      let inner = s.slice(i + 1, j);
+      const k = inner.lastIndexOf(":");
+      if (k >= 0) {
+        const tail = inner.slice(k + 1).trim();
+        if (tail !== "" && !isNaN(Number(tail))) inner = inner.slice(0, k);
+      }
+      out += inner;
+      i = j + 1;
+      continue;
+    }
+    out += ch;
+    i += 1;
+  }
+  return out;
+}
+
+/** CLIP BPE 近似计数：按逗号切段、按空白切词，每词 ceil(len*2/9)（≈4.5 字符/token）。 */
+export function clipTokens(text) {
+  if (!text) return 0;
+  let total = 0;
+  plainTags(text).split(",").forEach(seg => {
+    seg.split(/\s+/).forEach(word => {
+      const w = word.replace(/^[()[\]{}:;.!?]+|[()[\]{}:;.!?]+$/g, "");
+      if (!w) return;
+      total += Math.max(1, Math.ceil((w.length * 2) / 9));
+    });
+  });
+  return total;
+}
+
+/** 相机段 token 预算 → { positive, negative, total, limit, warn, level }。 */
+export function budgetOf(positive, negative) {
+  const p = clipTokens(positive);
+  const n = clipTokens(negative);
+  const total = p + n;
+  const level = total > CLIP_TOK_LIMIT ? "danger" : (total > CLIP_TOK_WARN ? "warn" : "ok");
+  return {
+    positive: p, negative: n, total: total,
+    limit: CLIP_TOK_LIMIT, warn: CLIP_TOK_WARN, level: level,
+  };
+}
+
 export const SDXL_TAGS = V;
 export { V, NEG };   // 供 js/sdxl_camera_widget.js 与标签面板直接引用
 
 export default {
   V: V, NEG: NEG, PRESETS: PRESETS, PRESET_NAMES: PRESET_NAMES,
   computeCamera: computeCamera, sdxlWeight: sdxlWeight, focalToFov: focalToFov,
+  clipTokens: clipTokens, budgetOf: budgetOf,
 };

@@ -96,13 +96,13 @@ python sdxl_camera_angle/tests/test_core.py     # 纯 assert 自测
 | `focal` | FLOAT 8..400 / 1.0 | 50.0 | 等效焦距：14 超广角 / 24 广角 / 35 人文 / 50 标准 / 85 人像 / 135 长焦（同时决定 `fov_deg`） |
 | `pan_x` | FLOAT -1..1 / 0.05 | 0.0 | 构图横移：>0 相机右移 → 主体偏左三分线，右侧留白 |
 | `pan_y` | FLOAT -1..1 / 0.05 | 0.0 | 构图纵移：>0 主体压低（上方留白、地平线偏低），<0 主体抬高 |
-| `subject_yaw` | FLOAT -1..1 / 0.05 | 0.0 | **主体朝向**（与机位解耦）：0 面向镜头，±0.45 侧身 3/4，±0.9 完全背对 |
+| `subject_yaw` | FLOAT -1..1 / 0.05 | 0.0 | **主体朝向（世界坐标系）**：0 = 面向世界正前方，±0.45 侧身 3/4，±0.9 完全背对；实际朝向按 `rel_yaw = wrap(subject_yaw − pos_x)` 相对相机判定（机位转到背后时同一 yaw 会变成背身） |
 | `gaze_mode` | auto / camera / away | auto | 视线：auto 按朝向与机位推导（含回眸）；camera 强制看镜头；away 强制看别处 |
 | `preset` | COMBO（17 项） | 自定义 | 非「自定义」时**预设覆盖机位与光学参数**（滑块值仍留在 UI 上，动滑块会自动跳回自定义） |
 | `strength` | FLOAT 0..2 / 0.05 | 1.0 | 权重曲线强度，0 = 全部中性（只剩裸短语） |
 | `weight_mode` | tanh / linear / raw | tanh | tanh 推荐；linear 线性截断；raw 直通（调试对比用） |
 | `azimuth_mode` | 8bin / 4bin | 8bin | 8bin = 8 方向 + 双档插值；4bin = 原仓库 cos/sin 四向分解 |
-| `elevation_mode` | 3bin / 5bin | 3bin | 5bin 在 \|pos_y\|>0.75 时改用 bird / worm |
+| `elevation_mode` | 3bin / 5bin | 3bin | 5bin 在 \|pos_y\|>0.75 时改用 bird / worm；两种模式在 \|pos_y\|>0.9 都锁存成 bird / worm（真顶视） |
 | `neg_strength` | FLOAT 0..2 / 0.05 | 1.0 | 负向强度，**0 = 完全关闭负向**（输出空串） |
 | `extra_positive` | STRING 多行 | "" | 原样追加到正向末尾 |
 | `extra_negative` | STRING 多行 | "" | 原样追加到负向末尾 |
@@ -119,7 +119,8 @@ python sdxl_camera_angle/tests/test_core.py     # 纯 assert 自测
  "elevation": "eye", "distance": "medium", "dutch": false, "roll_deg": 0.0,
  "az_gate": 1.0, "pole_gate": 1.0, "azimuth_suppressed": false, "behind_ratio": 0.0,
  "framing": [], "subject": "subject_front", "gaze": "gaze_viewer",
- "subject_yaw": 0.0, "pan": [0.0, 0.0],
+ "subject_yaw": 0.0, "rel_yaw": 0.0, "pan": [0.0, 0.0],
+ "tokens": {"positive": 44, "negative": 0, "total": 44, "limit": 75, "warn": 65, "level": "ok"},
  "preset": "自定义", "strength": 1.0, "weight_mode": "tanh",
  "azimuth_mode": "8bin", "elevation_mode": "3bin", "neg_strength": 0.0,
  "parts": [{"kind": "az", "key": "front", "ratio": 1.0, "raw": 10.0, "weight": 1.4,
@@ -129,7 +130,8 @@ python sdxl_camera_angle/tests/test_core.py     # 纯 assert 自测
 ```
 
 `bins` 是三元组 `[key, ratio, kind]`，`kind` ∈ `az/el/di/lens/tg/frame/subject/gaze` —— 只看方位就过滤 `kind == "az"`。
-`parts[].tokens` 是最终写进提示词的字符串（含权重括号），可直接做 token 预算。
+`parts[].tokens` 是最终写进提示词的字符串（含权重括号），可直接做 token 预算；
+`camera_info.tokens` 就是相机段的预算结果（`clip_tokens` 估算，`level ∈ ok/warn/danger`）。
 
 `_cfg_json` 覆盖示例（只写要改的键，其余走默认值，深合并）：
 
@@ -215,6 +217,8 @@ SDXL 的两个文本编码器（CLIP-L 与 OpenCLIP-bigG）都是 **75 token/块
 而 SDXL 的 **pooled 向量只取第 0 块**（`sd1_clip.py:50 first_pooled = pooled[0:1]`），文本塔又是因果
 注意力 —— 所以相机词一旦被挤到第 1 块，pooled 里就没有它了，构图会明显失灵。
 
+- **预算红线：相机段 65 token 标黄、75 token 封顶**。节点 3D 视口与 Studio 面板都实时显示 `44 / 75 tok`，
+  超 65 变橙、超 75 变红 —— 超了不报错，CLIP 会静默截断，被砍掉的往往是排在后面的 `gaze`/`lens`；
 - 每块 77 槽 = 1 BOS + 75 内容 + 1 EOS；**`(tag:1.40)` 的括号与权重不占 token**（tokenize 前剥离），
   但 **逗号占 1 token**。
 - 本节点默认词表很紧凑：front 11 / front_right 7 / right 8 / back 9 / high 6 / eye 3 / low 9 /
@@ -281,6 +285,35 @@ python tools/sweep_camera.py --mode sequence     # 三视图 / 推拉序列
 | 俯视/仰视没反应 | 高度词被方位门控压掉，或底模不认 `high angle` | `elevation_mode="5bin"` 走 bird/worm；负向加 `from below` |
 | 负向里反向词互相打架 | `neg_strength` 过大 | 降到 0.5~0.8，或 0 关闭 |
 | 拖 3D 视口没反应 | 前端扩展没缓存刷新 | 强制刷新浏览器；确认 `three.module.js` 与 JS 同目录 |
+| 控制台刷 `PermissionError: [Errno 13] ... config.json.xxxx.tmp`、`POST /api/config 500` | 启动用的 python 是**低完整性**进程，而项目目录没给它写权限 | 见下面「写不进 state / out 目录」 |
+
+### 写不进 state / out 目录（低完整性 python）
+
+ComfyUI 便携版自带的 `python.exe` 是**低完整性进程**（mandatory label `S-1-16-4096`）。
+Windows 的 No-Write-Up 规则规定：低完整性进程只能写**同等或更低**完整性标签的对象。所以：
+
+- 在 `D:\QUARK\ComfyUI-aki-v3.2` 下跑一切正常——那棵树本来就在这个 sandbox 里；
+- 项目搬到 `D:\DSh canera`（普通目录，中完整性）之后，`/api/config` 的临时文件就写不进去，
+  日志里一直刷 `Permission denied`。
+
+一行修法（对项目目录打低完整性标签，子项继承）：
+
+```bat
+icacls "D:\DSh canera" /setintegritylevel (OI)(CI)L
+```
+
+或者换解释器：用系统 python（中完整性）启动服务不会有这个问题，代价是
+`tools/token_count.py` 拿不到 ComfyUI 的分词器，token 数退化成估算（`method: "estimate"`）。
+
+体检脚本（用**真正启动服务的那只 python** 跑）：
+
+```bat
+"D:\QUARK\ComfyUI-aki-v3.2\python\python.exe" tools\check_env.py
+```
+
+代码侧现在也不会再 500：临时文件被拒时 `store.atomic_write_json` 退化成直接写目标文件，
+仍失败则抛 `StoreWriteError`（带上面那句提示），`/api/config` 回
+`200 {"ok": false, "message": "..."}`，界面把话显示出来而不是崩掉。
 
 ## 实拍验证（SDXL 真实出图扫描）
 
@@ -352,15 +385,18 @@ e2e PASS 13 FAIL 0 SKIP 1**。
 
 - 距离档位仍是**档间跳变**（沿用原仓库阈值），档内只有轻微的 `0.5*|z|` 增强；
   想要连续变焦请用 3D UI 微调 pos_z 或外接提示词。
-- `elevation_mode="5bin"` 在 \|pos_y\|=0.75 处是硬切换（high ↔ bird），没有双档混合。
+- `elevation_mode="5bin"` 在 \|pos_y\|=0.75 处是硬切换（high ↔ bird），没有双档混合；
+  3bin 也在 \|pos_y\|>0.9 处锁存到 bird / worm（`POLE_LATCH`），所以 3bin 拖到底同样是真顶视。
 - SPEC 2.1 校验表里 `raw=0.5 → 0.92` 与曲线公式实际值 `0.93` 差 0.01：这里**按公式实现**
   （公式是准的，0.92 是手算笔误），单测断言 0.93。
 - 焦距只改**透视语义与景深**，不真的移动相机；"退后拉近"要同时动 `pos_z`。
 - `pan_x/pan_y` 是相机平移而非主体平移（`pan_x>0` → 主体偏左三分线）。两者混用会得到"主体没动但背景歪了"的图。
+- `subject_yaw` 是**世界坐标系**朝向（v2.1 起）：早期按「相对相机」解释，背面机位 + yaw=0 会同时说人正对镜头
+  和相机在背后；现在统一成 `rel_yaw = wrap(subject_yaw − pos_x)`，老参数想保持原效果请换算 `wrap(相对角 + pos_x)`。
 - 极点区（\|pos_y\|>0.75）方位词会衰减/关闭，此时`pos_x` 基本无效 —— 这是刻意的，不是 bug。
   极点区还会把视线短语从 `looking at viewer` 换成 `looking up/down at the viewer`（`POLE_GAZE`），
   否则竖直机位会退化成「正面/背面站立」。鸟瞰（py>0.75）实测更偏高机位俯拍而非严格正上方顶视，
-  要更硬的正顶视请用 `elevation_mode="5bin"` 并把 `strength` 提到 1.2 以上。
+  3bin 在 \|pos_y\|>0.9 已锁存成 bird / worm（v2.1 `POLE_LATCH`），要更硬的顶视可再叠 `elevation_mode="5bin"` 并把 `strength` 提到 1.2 以上。
 - `tools/parity_check.py` 是**静态正则**比对（本机无 node），能保证常量与词表一致，不能保证 JS 运行时无异常；
   运行时验证靠 `js/sdxl_camera_widget.js` 的桩环境实跑与工作台 `e2e`。
 

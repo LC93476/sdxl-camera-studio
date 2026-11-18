@@ -261,6 +261,22 @@ v2 新参数（focal / roll / pan / subject_yaw / gaze）不走工作台模板�
 > 极点两条最能说明问题：竖直机位下 `looking at viewer` 会把画面拉回「正面站立」，所以 |pos_y|>0.75 时视线短语
 > 改写成 `looking up/down at the viewer`（`POLE_GAZE`），配合 `POLE_BLOCK_TOKENS` 剔掉的正面词，顶视/仰拍才真的出得来。
 
+### 5e. v2.1 修正实测
+
+v2.1 修的是**语义与坐标**，不是新功能；三处都影响出图，光看 UI 看不出来：
+
+| # | 问题 | 修法 | 实测 |
+|---|---|---|---|
+| 1 | 极点区视线与高度词打架：py=0.95 时正向同时有 `top-down view` 和 `looking at viewer`，模型给「背面站立回眸」 | `POLE_GAZE` 按 py 正负改写视线短语 | 同参数改出「正上方俯拍 + 主体抬头」 |
+| 2 | `subject_yaw` 原本按「相对相机」解释：背面机位 + yaw=0 会同时说「人正对镜头」和「相机在背后」 | 改世界系 `rel_yaw = wrap(subject_yaw - pos_x)`，另加两条去重（前方机位不发 subject_front、背后机位不发 subject_away） | pos_x=1.0 yaw=0 -> 只出 `from behind` 三条 + `looking away`，不再有 `facing the camera` |
+| 3 | 3bin 拖到端点只给 `high angle shot`，出图是「稍高的平视」而不是顶视 | `POLE_LATCH=0.9`：`abs(pos_y)>0.9` 时 high/low 锁存成 bird/worm | pos_y=±1.0 出真顶视俯拍 / 贴地仰拍，±0.9 保持 high/low 作对照 |
+
+3D 视口侧同期改的：roll 满量程 ±45 度、`lookAt` 目标按 pan 沿相机 right/up 偏移 2.0、取景框外环拖拽改 roll、
+脚下箭头拖 subject_yaw、Alt+拖拽 pan（松手才 commit）。另外修了两个真 bug：单面拾取材质导致外环永远打不中；
+roll 在已被自身旋转的坐标系里量角，导致拖 30 度只出 15 度。
+
+> token 预算：相机正向段 >65 标黄、>75 标红（CLIP Chunk 0 上限 75）。工作台 `42 / 75 tok`、节点视口 `44 / 75 tok` 同一口径。
+
 ## 6. HTTP API
 
 全部 JSON、UTF-8，根地址 `http://127.0.0.1:{PORT}`；错误统一 4xx/5xx + `{"error": "..."}`。

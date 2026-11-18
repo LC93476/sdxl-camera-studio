@@ -5,15 +5,19 @@
  *   pos_x ∈ [-1,1]  → 方位角 az = pos_x * π（0 = 正面 +Z，+1 = 背面 -Z，右侧为正）
  *   pos_y ∈ [-1,1]  → 仰角 el = pos_y * 78°（+ 俯视 / - 仰视）
  *   pos_z ∈ [-1,1]  → 距离（+ 近 / - 远）
- *   roll  ∈ [0,1]   → 画面线框倾斜 roll*30°
+ *   roll  ∈ [-1,1]  → 画面线框倾斜 roll*45°（负值 = 反向荷兰角）
  *   focal ∈ [4,1200] → 水平视场角 fov = 2*atan(36/(2*focal))（36mm 全画幅宽；单一真源 js/camera_shared.js）
  *   pan_x/pan_y ∈ [-1,1] → 构图偏移（pan_x>0 = 相机右移 → 主体偏左；pan_y>0 = 主体偏下）
  *   subject_yaw ∈ [-1,1] → 主体朝向（0 正面 / ±0.28 起四分之三 / ±0.72 起背身）
  *   gaze_mode ∈ {auto,camera,away} → 视线（auto 走 subjectKeys 的自动判定）
  *
- * 对外 API：new CameraRig(canvasEl, { onChange }) / setState({...}) / getState() /
+ * 对外 API：new CameraRig(canvasEl, { onChange, onCommit }) / setState({...}) / getState() /
  *           resize() / dispose() / setRefImage(url) / setRefOpacity(v) /
  *           toggleGrid(force) / toggleFrustum(force) / applyShot(n)
+ *
+ * 直接操纵（task-7）：脚下黄色箭头拖 subject_yaw / 取景框外环拖 roll /
+ *           Alt + 拖画布调 pan_x·pan_y。拖动过程 onChange(v, {live:true}) 只刷预览，
+ *           pointerup 才发一次不带 live 的回调 → app.js 在那里做持久化提交。
  */
 import * as THREE from "/js/three.module.js";
 import { focalToFov, azimuthBins, elevationKey, subjectKeys } from "/js/camera_shared.js";
@@ -45,6 +49,17 @@ const FRUSTUM_D = 1.55;
 // 视口相机 fov 直接取 focal 换算的值，但夹在这个区间里，否则 200mm 会把导航压成针孔
 const VIEW_FOV_MIN = 26;
 const VIEW_FOV_MAX = 74;
+
+// roll：±1 → ±45°，负值就是反向荷兰角
+const ROLL_MAX = 45 * DEG;
+// pan_x/pan_y 是构图系数，乘这个常量换成相机空间的注视点偏移（量级≈人体宽度 1 单位）
+const PAN_SCALE = 2.0;
+// 取景框外环热区半径 = 角点半径 × 1.08（即框外 8%），命中即进 roll 拖拽
+const FRAME_RING_K = 1.08;
+// Alt + 拖拽：每像素换多少 pan（1000px 画布上拖 200px ≈ 1.0）
+const PAN_DRAG_K = 0.005;
+
+const WORLD_UP = new THREE.Vector3(0, 1, 0);
 
 const COLOR = {
   bg: 0x16171b,
@@ -79,6 +94,7 @@ export class CameraRig {
 
     this.canvas = canvasEl;
     this.onChange = typeof options.onChange === "function" ? options.onChange : null;
+    this.onCommit = typeof options.onCommit === "function" ? options.onCommit : null;
     this.state = {
       pos_x: 0, pos_y: 0, pos_z: 0, roll: 0,
       focal: 50, pan_x: 0, pan_y: 0, subject_yaw: 0, gaze_mode: "auto",
@@ -218,6 +234,13 @@ export class CameraRig {
     arrow.add(head);
 
     arrow.position.y = 0.02;
+
+    // 可拖热区：箭头本身太细，套一个不可见盒体，raycast 才好命中
+    this.footHit = new THREE.Mesh(new THREE.BoxGeometry(0.52, 0.3, 0.9), this._hitMaterial());
+    this.footHit.position.set(0, 0.1, 0.2);
+    this.footHit.userData.pick = "yaw";
+    arrow.add(this.footHit);
+
     this.footArrow = arrow;
     this.subjectRig.add(arrow);
 
@@ -313,12 +336,15 @@ export class CameraRig {
     this.scene.add(this.arcGroup);
   }
 
+  // 不可见拾取材质。必须 DoubleSide：取景框外环（frameRingHit）的平面朝向与视线相反，
+  // 单面材质会让 raycaster 永远打不中，拖拽转 roll 会退化成 orbit。
   _hitMaterial() {
     return new THREE.MeshBasicMaterial({
       color: 0xffffff,
       transparent: true,
       opacity: 0,
       depthWrite: false,
+      side: THREE.DoubleSide,
     });
   }
 
@@ -416,6 +442,15 @@ export class CameraRig {
     );
     this.frameGrp.add(this.subjectDot);
 
+    // 取景框外环热区（不可见）：命中即进入 roll 旋转拖拽，半径 = 角点半径 × 1.08
+    const ringR = 0.5 * Math.hypot(FRAME_W, FRAME_H) * FRAME_RING_K;
+    this.frameRingHit = new THREE.Mesh(
+      new THREE.RingGeometry(ringR * 0.86, ringR, 56),
+      this._hitMaterial()
+    );
+    this.frameRingHit.userData.pick = "roll";
+    this.frameGrp.add(this.frameRingHit);
+
     g.add(this.frameGrp);
     this.camGroup = g;
     this.scene.add(g);
@@ -501,7 +536,7 @@ export class CameraRig {
 
   _pick(e) {
     const ray = this._toNDC(e);
-    const hits = ray.intersectObjects([this.azHit, this.elHit], false);
+    const hits = ray.intersectObjects([this.azHit, this.elHit, this.footHit, this.frameRingHit], false);
     if (!hits.length) return null;
     return hits[0].object.userData.pick || null;
   }
@@ -512,6 +547,8 @@ export class CameraRig {
     const hit = this._pick(e);
     if (hit) {
       mode = hit;
+    } else if (e.altKey) {
+      mode = "framing";        // Alt + 拖画布：调构图 pan_x / pan_y
     } else if (e.button === 2 || e.shiftKey) {
       mode = "pan";
     } else if (e.button === 0) {
@@ -519,7 +556,12 @@ export class CameraRig {
     }
     if (!mode) return;
 
-    this.drag = { mode, x: e.clientX, y: e.clientY };
+    this.drag = { mode, x: e.clientX, y: e.clientY, mutated: false };
+    if (mode === "roll") {
+      // 抓取点的框内角度 + 当前 roll：拖动按角度差换算，抓哪儿都不会跳
+      this.drag.a0 = this._frameAngle(e);
+      this.drag.r0 = clamp(this.state.roll, -1, 1);
+    }
     this.canvas.classList.add("dragging");
     try {
       this.canvas.setPointerCapture(e.pointerId);
@@ -529,6 +571,7 @@ export class CameraRig {
     e.preventDefault();
 
     if (mode === "az" || mode === "el") this._dragDot(mode, e);
+    else if (mode === "yaw") this._dragYaw(e);
   }
 
   _pointerMove(e) {
@@ -542,6 +585,14 @@ export class CameraRig {
       this._dragDot(mode, e);
       return;
     }
+    if (mode === "yaw") {
+      this._dragYaw(e);
+      return;
+    }
+    if (mode === "roll") {
+      this._dragRoll(e);
+      return;
+    }
 
     const dx = e.clientX - this.drag.x;
     const dy = e.clientY - this.drag.y;
@@ -551,6 +602,13 @@ export class CameraRig {
     if (mode === "orbit") {
       this.orbit.theta -= dx * 0.0075;
       this.orbit.phi = clamp(this.orbit.phi - dy * 0.0065, 0.2, Math.PI - 0.2);
+    } else if (mode === "framing") {
+      // 向右拖 = 主体右移（pan_x 减小）；向下拖 = 主体下移（pan_y 增大）
+      this.state.pan_x = clamp(this.state.pan_x - dx * PAN_DRAG_K, -1, 1);
+      this.state.pan_y = clamp(this.state.pan_y + dy * PAN_DRAG_K, -1, 1);
+      this.drag.mutated = true;
+      this._sync();
+      this._emit({ live: true });
     } else {
       const k = this.orbit.radius * 0.0015;
       const right = new THREE.Vector3(1, 0, 0).applyQuaternion(this.view.quaternion);
@@ -563,13 +621,19 @@ export class CameraRig {
   }
 
   _pointerUp(e) {
-    if (!this.drag) return;
+    const drag = this.drag;
+    if (!drag) return;
     this.drag = null;
     this.canvas.classList.remove("dragging");
     try {
       if (e && e.pointerId !== undefined) this.canvas.releasePointerCapture(e.pointerId);
     } catch (_) {
       /* 已释放 */
+    }
+    // 拖动过程只发 live 回调（只刷预览）；松手才发不带 live 的一次 → 由 app.js 提交持久化
+    if (drag.mutated) {
+      this._emit();
+      if (this.onCommit) this.onCommit(this.getState());
     }
   }
 
@@ -612,8 +676,52 @@ export class CameraRig {
       this.state.pos_y = clamp(a / LEAN, -1, 1);
     }
 
+    if (this.drag) this.drag.mutated = true;
     this._sync();
-    this._emit();
+    this._emit({ live: true });
+    this._invalidate();
+  }
+
+  /** 取景框平面上的指针角度（roll 旋转拖拽用；拿不到交点返回 null） */
+  _frameAngle(e) {
+    const ray = this._toNDC(e);
+    const normal = new THREE.Vector3(0, 0, 1).applyQuaternion(this.camGroup.quaternion);
+    const origin = new THREE.Vector3();
+    this.frameGrp.getWorldPosition(origin);
+    const plane = new THREE.Plane().setFromNormalAndCoplanarPoint(normal, origin);
+    const p = new THREE.Vector3();
+    if (!ray.ray.intersectPlane(plane, p)) return null;
+    // 在 camGroup 空间量角度，不要用 frameGrp.worldToLocal：frameGrp 自身被 roll 带着转
+    // (rotation.z = roll * 45°)，在它内部量角度会把「框转过去了、指针没动」也算成角度变化，
+    // 形成负反馈（拖 30° 只出 15°）。camGroup 不含 roll，角度只跟指针走。
+    const local = p.sub(origin).applyQuaternion(this.camGroup.quaternion.clone().invert());
+    return Math.atan2(local.y, local.x);
+  }
+
+  /** 拖取景框外环：框内角度差 → roll ∈ [-1,1]（45° 满刻度） */
+  _dragRoll(e) {
+    const a = this._frameAngle(e);
+    if (a == null || this.drag.a0 == null) return;
+    let d = a - this.drag.a0;
+    while (d > Math.PI) d -= Math.PI * 2;
+    while (d < -Math.PI) d += Math.PI * 2;
+    this.state.roll = clamp(this.drag.r0 + d / ROLL_MAX, -1, 1);
+    this.drag.mutated = true;
+    this._sync();
+    this._emit({ live: true });
+    this._invalidate();
+  }
+
+  /** 拖脚下箭头：地面射线 → 绕人体竖直轴的角度 → subject_yaw ∈ [-1,1] */
+  _dragYaw(e) {
+    const ray = this._toNDC(e);
+    const plane = new THREE.Plane(WORLD_UP.clone(), -DOT_Y);
+    const p = new THREE.Vector3();
+    if (!ray.ray.intersectPlane(plane, p)) return;
+    this.state.subject_yaw = clamp(Math.atan2(p.x, p.z) / Math.PI, -1, 1);
+    this.drag.mutated = true;
+    this._sync();
+    this._emit({ live: true });
     this._invalidate();
   }
 
@@ -692,9 +800,19 @@ export class CameraRig {
     const cy = ANCHOR_Y + dist * sinEl;
     const cz = dist * cosEl * cosAz;
     this.camGroup.position.set(cx, cy, cz);
-    this.camGroup.lookAt(this.target);
 
-    const tilt = clamp(s.roll, 0, 1) * 30 * DEG;
+    // 注视点按 pan_x / pan_y 沿相机局部 right/up 偏移 —— 视锥与取景框才真实反映三分法
+    const eye = new THREE.Vector3(cx, cy, cz);
+    const base = this.target.clone();
+    const fwd = base.clone().sub(eye).normalize();
+    const right = new THREE.Vector3().crossVectors(fwd, WORLD_UP).normalize();
+    const up = new THREE.Vector3().crossVectors(right, fwd).normalize();
+    const aim = base.clone()
+      .addScaledVector(right, clamp(s.pan_x, -1, 1) * PAN_SCALE)
+      .addScaledVector(up, clamp(s.pan_y, -1, 1) * PAN_SCALE);
+    this.camGroup.lookAt(aim);
+
+    const tilt = clamp(s.roll, -1, 1) * ROLL_MAX;
     this.frameGrp.rotation.z = tilt;
 
     const arr = this.link.geometry.attributes.position.array;
@@ -756,7 +874,7 @@ export class CameraRig {
     this.horizon.visible = Math.abs(off) <= HALF_H * 1.35;
   }
 
-  _emit() {
+  _emit(meta) {
     if (!this.onChange) return;
     const s = this.state;
     this.onChange({
@@ -769,7 +887,7 @@ export class CameraRig {
       pan_y: r3(s.pan_y),
       subject_yaw: r3(s.subject_yaw),
       gaze_mode: String(s.gaze_mode || "auto"),
-    });
+    }, meta || null);
   }
 
   _applyView() {
@@ -854,7 +972,7 @@ export class CameraRig {
     if (Number.isFinite(next.pos_x)) s.pos_x = clamp(next.pos_x, -1, 1);
     if (Number.isFinite(next.pos_y)) s.pos_y = clamp(next.pos_y, -1, 1);
     if (Number.isFinite(next.pos_z)) s.pos_z = clamp(next.pos_z, -1, 1);
-    if (Number.isFinite(next.roll)) s.roll = clamp(next.roll, 0, 1);
+    if (Number.isFinite(next.roll)) s.roll = clamp(next.roll, -1, 1);
     if (Number.isFinite(next.focal)) s.focal = clamp(next.focal, 4, 1200);
     if (Number.isFinite(next.pan_x)) s.pan_x = clamp(next.pan_x, -1, 1);
     if (Number.isFinite(next.pan_y)) s.pan_y = clamp(next.pan_y, -1, 1);

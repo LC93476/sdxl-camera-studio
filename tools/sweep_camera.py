@@ -147,7 +147,8 @@ def main():
         for x in (-1.0, -0.75, -0.5, -0.25, 0.0, 0.25, 0.5, 0.75, 1.0):
             cases.append(("pos_x=%+.2f" % x, dict(base, pos_x=x)))
     elif args.mode == "elevation":
-        for y in (-0.9, -0.6, -0.3, 0.0, 0.3, 0.6, 0.9):
+        # ±1.0 用来验收 v2.1 的极点锁存（|pos_y|>0.9 升级成 bird/worm），±0.9 是不锁存的对照
+        for y in (-1.0, -0.9, -0.6, -0.3, 0.0, 0.3, 0.6, 0.9, 1.0):
             cases.append(("pos_y=%+.2f" % y, dict(base, pos_x=0.0, pos_y=y)))
     elif args.mode == "distance":
         for z in (0.9, 0.5, 0.1, -0.2, -0.5, -0.9):
@@ -232,8 +233,14 @@ def main():
         items.append((p, name, sub))
 
     if items:
-        grid(items, os.path.join(args.out, "grid_%s%s.jpg" % (args.mode, ("_" + args.tag) if args.tag else "")),
-             9 if args.mode in ("azimuth", "preset") else 4)
+        grid_path = os.path.join(args.out, "grid_%s%s.jpg" % (args.mode, ("_" + args.tag) if args.tag else ""))
+        try:
+            grid(items, grid_path, 9 if args.mode in ("azimuth", "preset") else 4)
+            print("  拼图: %s" % grid_path)
+        except ImportError as exc:
+            # 没有 Pillow 也要把图跑完：拼图只是方便看，不是产物
+            print("  [skip] 拼图需要 Pillow（%s）；%d 张图已在 %s" % (exc, len(items), args.out))
+            print("         想拼图: pip install Pillow")
 
 
 if __name__ == "__main__":

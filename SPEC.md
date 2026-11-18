@@ -81,6 +81,8 @@ bin j 的中心角 `θ_j = -π + j*π/4`：j=0→-180(back) 1→-135(back_left) 
 ### 2.4 方位门控与高度
 - `az_gate = clamp((1-|pos_y|)/(1-0.9), 0, 1)`（沿用）。
 - 高度 3 档 + 可选 5 档（`elevation_mode="3bin"|"5bin"`，5 档在 |pos_y|>0.75 时启用 bird/worm）。
+  两种模式在 `|pos_y| > POLE_LATCH(0.9)` 都锁存成 bird / worm——拖到端点必须出真顶视/贴地，否则 3bin 只给
+  `high angle shot`，出图是「稍高的平视」。锁存用严格大于，0.9 本身仍是 high/low。
 - 高度 raw 权重：`|pos_y| * 10 + extra`；**平视档 raw 固定 1.0**（原仓库给 10 是 danbooru 时代的 hack，SDXL 不要）。
 - 距离 6 档沿用阈值，但**档内做连续插值**：`raw = 1 + 9*|pos_z - z_center(bin)| ...` 不需要，保持档位跳变，
   默认 raw = 1.0 + 0.5*|pos_z| 让极端档稍强，strength 可调。
@@ -100,8 +102,10 @@ front_left:  "three-quarter view from the left"
 high:        "high angle shot, from above"
 eye:         "eye level shot"
 low:         "low angle shot, from below, looking up"
-bird:        "from above, high angle, looking down at viewer, top-down view"
-worm:        "from below, low angle, looking up at viewer"
+bird:        "bird's-eye view, top-down view, aerial shot, from above"
+worm:        "worm's-eye view, extreme low angle, from below"
+# 注意：极点词只描述**机位**，不含 looking down/up at viewer —— 视线由 POLE_GAZE 单独改写，
+# 否则同一段里 "looking down at viewer"（机位）与 "looking up at the viewer"（视线）互相打架。
 ecu:         "extreme close-up, macro shot"
 cu:          "close-up, portrait shot"
 medium:      "medium shot, waist up"
@@ -201,10 +205,27 @@ camera_info.roll_deg = roll*45。
 - 权重 raw = 1 + 2.0*|v|（slope 可 cfg 覆盖）。
 
 ### 7.4 主体朝向 subject_yaw in [-1,1] + gaze_mode in {auto,camera,away}
-- |yaw| < 0.28 → subject_front（面向镜头）；<0.72 → subject_turn（三分之四背转）；>=0.72 → subject_away。
+- `subject_yaw` 是**世界坐标系**朝向（0 = 面向世界 +Z，±1 = 背向），与 `studio/web/camera3d.js`
+  的朝向箭头同一套角度；`pos_x` 是相机方位（0 正面、±1 背面）。判定前先求相对角：
+  `rel_yaw = wrap(subject_yaw - pos_x)`，`wrap(v) = ((v + 1) mod 2) - 1`。
+- |rel_yaw| < 0.28 → subject_front（面向镜头）；< 0.72 → subject_turn（三分之四背转）；>= 0.72 → subject_away。
+- 去重：`subject_front` 且机位正面扇区 > 0.5 → 不发（与 front view 重复）；
+  `subject_away` 且机位背面扇区 > 0.45 → 不发（与 from behind / back view 重复）。
 - 视线：gaze_mode=camera → gaze_viewer；away → gaze_away；auto 时
-  subject_front → viewer；机位在背面（back 系 bins 权重和 > 0.45）且 |yaw| <= 0.72 → gaze_over_shoulder（回眸）；其余 → away。
-- 视线词裸写（权重 1.00），朝向词 raw = 1 + 2.0*|yaw|。
+  subject_front → viewer；机位在背面（back 系 bins 权重和 > 0.45）且 |rel_yaw| <= 0.72 →
+  gaze_over_shoulder（回眸）；其余 → away。|pos_y| > 0.75 时 gaze_viewer 改写为 POLE_GAZE。
+- 视线词裸写（权重 1.00，回眸 raw 1.30），朝向词 raw = 1 + 2.0*|rel_yaw|。
+- 例：pos_x=1.0 + subject_yaw=0.0 → rel=-1 → subject_away（去重不发词）+ gaze_away，
+  **不再出现 front-facing body / looking at viewer**；pos_x=1.0 + subject_yaw=0.4 → rel=-0.6 → turn + 回眸。
+
+### 7.5 CLIP token 预算（相机段）
+
+- `clip_tokens(text)`：零依赖估算。剥掉 `(tag:1.40)` 权重语法 → 按逗号切段 → 按空白切词 →
+  每词 `ceil(len*2/9)`（≈4.5 字符/token）。误差 ±10%，用于实时提示，不参与出图。
+- `token_budget(positive, negative)` → `{positive, negative, total, limit:75, warn:65, level}`；
+  `level = ok | warn(>65) | danger(>75)`。75 是 Chunk 0 的内容 token 上限（77 − 起止符）。
+- 同步契约：`js/camera_shared.js` 导出 `CLIP_TOK_LIMIT/CLIP_TOK_WARN/plainTags/clipTokens/budgetOf`，
+  `tools/parity_check.py` 比对阈值与函数存在性。
 
 ## 8. v2 极点消歧
 
@@ -213,15 +234,21 @@ POLE_START = 0.75、POLE_DEG = 75、POLE_NORM = 75/90 = 0.8333、AZ_SUPPRESS = 0
 - pole_gate(y) = clamp((1-|y|)/(1-0.75), 0, 1)（0.75 处 1，1.0 处 0）。
 - 有效方位系数 gate = az_gate(y) * pole_gate(y)；gate < 0.12 时**整段方位词被丢弃**，
   camera_info.azimuth_suppressed = true（|pos_y| 约 0.94 以上必触发）。
+- `|pos_y| > 0.9` 时高度档位锁存成 bird/worm（`POLE_LATCH`，3bin/5bin 都适用）；
 - |pos_y| > 0.75 时按高度档位剔除方位/视线里的冲突 token（POLE_BLOCK_TOKENS）：
-  - bird: front view / straight-on shot / facing the camera / eye level shot / looking at viewer / direct eye contact
-  - worm: eye level shot / top-down view / looking down at viewer
+  - bird: front view / straight-on shot / facing the camera / eye level shot / looking at viewer / direct eye contact /
+    from behind / seen from behind / back view
+  - worm: eye level shot / top-down view / looking down at viewer / from above / high angle / bird's-eye view
   - high / low: eye level shot
-- 结果：pos_y=1, elevation_mode=5bin 只出 from above, high angle, looking down at viewer, top-down view + 距离 + 光学 + 构图，
-  **不再出现 from behind**。
+- 极点视线改写 `POLE_GAZE`（按 **py 正负**判定，不按 ekey）：
+  py > 0.75 → "looking up at the viewer"；py < -0.75 → "looking down at the viewer"。
+  理由：竖直机位下发 "looking at viewer" 会画成正面站立，实测 py=0.95 出的是背面回眸站姿。
+- 结果：pos_y=1, elevation_mode=5bin → bird's-eye view, top-down view, aerial shot, from above + 距离 + 光学 + 构图
+  + looking up at the viewer，**不再出现 from behind**。
 
 ## 9. v2 camera_info 增补字段
 
-focal, fov_deg, lens, roll_deg, pole_gate, azimuth_suppressed, behind_ratio, framing[], subject, gaze, subject_yaw, pan[2]；
+focal, fov_deg, lens, roll_deg, pole_gate, azimuth_suppressed, behind_ratio, framing[], subject, gaze,
+subject_yaw（世界系）, rel_yaw（= wrap(subject_yaw - pos_x)）, pan[2], tokens{positive,negative,total,limit,warn,level}；
 parts[] 每项 {kind, key, raw, weight, phrase, tokens[], note}，kind in {az, el, di, lens, tg, frame, subject, gaze}。
 

@@ -11,6 +11,9 @@
  */
 import { CameraRig } from './camera3d.js';
 import { focalToFov, framingKeys, subjectKeys } from '/js/camera_shared.js';
+// task-7 契约：js/camera_shared.js 提供 clipTokens / budgetOf（单一真源）。
+// 用命名空间导入 + 存在性检查，共享模块还没落地时页面照常跑；一落地就自动切过去。
+import * as SHARED from '/js/camera_shared.js';
 
 const API = {
   health: '/api/health',
@@ -33,9 +36,34 @@ const API = {
 
 const $ = (id) => document.getElementById(id);
 
-// token 预算阈值（正向 + 负向合计）：过 60 转黄，过 90 转红
-const TOKEN_WARN = 60;
-const TOKEN_DANGER = 90;
+// token 预算阈值（相机正向段）：> 65 标黄，> 75 标红（Chunk 0 上限）
+const TOKEN_WARN = 65;
+const TOKEN_LIMIT = 75;
+
+/**
+ * clipTokens 兜底：按逗号切 tag、每个词 1 token、长词（>6 字符）算 2。
+ * js/camera_shared.js 一旦导出 clipTokens / budgetOf，就用共享实现（下面两行常量选择）。
+ */
+function fallbackClipTokens(text) {
+  const s = String(text == null ? '' : text).trim();
+  if (!s) return 0;
+  let n = 0;
+  s.split(',').forEach((tag) => {
+    tag.trim().split(/\s+/).forEach((w) => {
+      if (w) n += w.length > 6 ? 2 : 1;
+    });
+  });
+  return n;
+}
+
+function fallbackBudgetOf(positive, negative) {
+  const p = fallbackClipTokens(positive);
+  const n = fallbackClipTokens(negative);
+  return { positive: p, negative: n, total: p + n, limit: TOKEN_LIMIT, warn: TOKEN_WARN };
+}
+
+const clipTokens = typeof SHARED.clipTokens === 'function' ? SHARED.clipTokens : fallbackClipTokens;
+const budgetOf = typeof SHARED.budgetOf === 'function' ? SHARED.budgetOf : fallbackBudgetOf;
 
 // focal 快捷档（mm）
 const FOCAL_STOPS = [14, 24, 35, 50, 85, 135];
@@ -329,38 +357,70 @@ function infoLine(info) {
 
 // ─────────────────────────── Token 预算 ───────────────────────────
 
-function tokenClass(total) {
-  if (total > TOKEN_DANGER) return 'danger';
-  if (total > TOKEN_WARN) return 'warn';
+function tokenLevel(pos, warn, limit) {
+  if (pos > limit) return 'danger';
+  if (pos > warn) return 'warn';
   return '';
 }
 
-function paintTokenBadges(total) {
-  const cls = tokenClass(total);
-  const badge = $('token_badge');
-  if (badge) {
-    badge.classList.toggle('warn', cls === 'warn');
-    badge.classList.toggle('danger', cls === 'danger');
+function paintTokenBadges(pos, warn, limit) {
+  const level = tokenLevel(pos, warn, limit);
+  ['token_badge', 'token_total'].forEach((id) => {
+    const el = $(id);
+    if (!el) return;
+    el.classList.toggle('tok-warn', level === 'warn');
+    el.classList.toggle('tok-danger', level === 'danger');
+    // styles.css 不在本任务文件范围，颜色内联兜底：标黄 / 标红一定看得见
+    el.style.color = level === 'danger' ? '#ff6b6b' : level === 'warn' ? '#ffcf5c' : '';
+  });
+}
+
+// 超上限提示行（动态建节点，不新增 DOM id）
+let tokenHintEl = null;
+
+function paintTokenHint(text) {
+  if (!tokenHintEl) {
+    const host = $('token_total');
+    const parent = host ? host.parentNode : null;
+    if (!parent) return;
+    tokenHintEl = document.createElement('div');
+    tokenHintEl.className = 'tk-warnline';
+    tokenHintEl.style.marginTop = '4px';
+    tokenHintEl.style.fontSize = '11px';
+    tokenHintEl.style.lineHeight = '1.4';
+    const parts = $('token_parts');
+    if (parts && parts.parentNode === parent) parent.insertBefore(tokenHintEl, parts);
+    else parent.appendChild(tokenHintEl);
   }
-  const tot = $('token_total');
-  if (tot) {
-    tot.classList.toggle('warn', cls === 'warn');
-    tot.classList.toggle('danger', cls === 'danger');
-  }
+  tokenHintEl.textContent = text || '';
+  tokenHintEl.hidden = !text;
+  if (text) tokenHintEl.style.color = '#ff6b6b';
 }
 
 function renderTokens(data) {
   const tk = (data && data.tokens) || {};
-  const pos = Math.round(num(tk.positive, 0));
-  const neg = Math.round(num(tk.negative, 0));
-  const total = tk.total != null ? Math.round(num(tk.total, pos + neg)) : pos + neg;
-  const method = tk.method ? String(tk.method) : 'estimate';
+  const positiveText = data && typeof data.positive === 'string' ? data.positive : '';
+  const negativeText = data && typeof data.negative === 'string' ? data.negative : '';
+
+  // 预算：limit / warn 由共享模块给（budgetOf），拿不到就用本地常量
+  const budget = budgetOf(positiveText, negativeText) || {};
+  const limit = Math.round(num(budget.limit, TOKEN_LIMIT));
+  const warn = Math.round(num(budget.warn, TOKEN_WARN));
+
+  // 数值优先用后端 /api/preview 的 tokens.positive，拿不到用 clipTokens 兜底
+  const pos = Number.isFinite(Number(tk.positive))
+    ? Math.round(Number(tk.positive))
+    : Math.round(num(budget.positive, clipTokens(positiveText)));
+  const neg = Number.isFinite(Number(tk.negative))
+    ? Math.round(Number(tk.negative))
+    : Math.round(num(budget.negative, clipTokens(negativeText)));
 
   const badge = $('token_badge');
-  if (badge) badge.textContent = 'T ' + total + ' · P ' + pos + ' · N ' + neg;
+  if (badge) badge.textContent = 'P ' + pos + ' · N ' + neg;
   const tot = $('token_total');
-  if (tot) tot.textContent = '总 ' + total + ' / ' + method;
-  paintTokenBadges(total);
+  if (tot) tot.textContent = pos + ' / ' + limit + ' tok';
+  paintTokenBadges(pos, warn, limit);
+  paintTokenHint(pos > limit ? '已超 Chunk 0 上限，相机词会被截断' : '');
 
   const list = $('token_parts');
   if (!list) return;
@@ -446,7 +506,7 @@ function markCustom() {
   if (el) el.value = '自定义';
 }
 
-function onRigChange(v) {
+function onRigChange(v, meta) {
   if (syncing) return;
   CAM_KEYS.forEach((k) => {
     if (Number.isFinite(v[k])) S[k] = v[k];
@@ -456,7 +516,8 @@ function onRigChange(v) {
   writeCameraUI();
   markCustom();
   schedulePreview();
-  scheduleConfigSave();
+  // 拖拽中（meta.live）只刷预览；松手那次不带 live，才提交持久化
+  if (!(meta && meta.live)) scheduleConfigSave();
 }
 
 // ─────────────────────────── 配置持久化 ───────────────────────────
@@ -1533,12 +1594,25 @@ async function init() {
   const canvas = $('view3d');
   if (canvas) {
     try {
-      rig = new CameraRig(canvas, { onChange: onRigChange });
+      rig = new CameraRig(canvas, {
+        onChange: onRigChange,
+        // 松手提交：立刻刷一次预览并写盘（拖动过程不会每个 pointermove 都 POST）
+        onCommit: () => {
+          refreshReadouts();
+          schedulePreview();
+          saveConfig();
+        },
+      });
     } catch (err) {
       rig = null;
       setStatus('3D 视图初始化失败：' + err.message, 'err');
     }
   }
+
+  // index.html 的 #roll 还是 min=0（不在本任务文件范围）：放宽到 -1，
+  // 否则拖外环拖出来的负向荷兰角在滑块上拨不回来
+  const rollEl = $('roll');
+  if (rollEl) rollEl.min = '-1';
 
   bindCameraInputs();
   bindTextInputs();

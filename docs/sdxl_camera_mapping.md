@@ -101,8 +101,8 @@ if self.pad_to_max_length and len(batch) < self.max_length:
 | high | high angle shot, from above | 6 | 8% |
 | eye | eye level shot | 3 | 4% |
 | low | low angle shot, from below, looking up | 9 | 12% |
-| bird | bird's-eye view, top-down shot | 10 | 13% |
-| worm | worm's-eye view, extreme low angle | 9 | 12% |
+| bird | bird's-eye view, top-down view, aerial shot, from above | 11 | 14% |
+| worm | worm's-eye view, extreme low angle, from below | 9 | 12% |
 | ecu | extreme close-up, macro shot | 7 | 9% |
 | cu | close-up, portrait shot | 6 | 8% |
 | medium | medium shot, waist up | 5 | 7% |
@@ -304,8 +304,8 @@ if has_weights:
 | high | high angle shot, from above | 6 | 1.05 ~ 1.25 | 曲线后的 `|y|·10` | 俯视要同时改"看得到头顶"和"背景在地面"，低了不起作用 |
 | eye | eye level shot | 3 | **1.00（裸词）** | 1.0 | 平视是 SDXL 默认视角，加权只会推向证件照。SPEC 2.4"平视 raw 固定 1.0"正确 |
 | low | low angle shot, from below, looking up | 9 | 1.05 ~ 1.25 | 同上 | 仰视在 SDXL 上比俯视弱，需略高；`looking up` 是关键锚 |
-| bird | bird's-eye view, top-down shot | 10 | 1.20 ~ 1.35 | 2.5 → 1.17 | 仅 `elevation_mode="5bin"` 且 `|y|>0.75` 出现；此时方位已被 `az_gate` 压到 0，可放心给高 |
-| worm | worm's-eye view, extreme low angle | 9 | 1.20 ~ 1.35 | 2.5 → 1.17 | 同上；`extreme` 与 bird/worm 互斥，别和 low/high 同现 |
+| bird | bird's-eye view, top-down view, aerial shot, from above | 11 | 1.20 ~ 1.35 | 2.5 → 1.17 | 仅 `elevation_mode="5bin"` 且 `|y|>0.75` 出现；此时方位已被 `az_gate` 压到 0，可放心给高 |
+| worm | worm's-eye view, extreme low angle, from below | 9 | 1.20 ~ 1.35 | 2.5 → 1.17 | 同上；`extreme` 与 bird/worm 互斥，别和 low/high 同现 |
 
 **门控提醒**：`az_gate = clamp((1-|pos_y|)/0.1)`（SPEC 2.4）在 `|pos_y|>0.9` 时为 0，虫瞰/鸟瞰档方位词整段消失。这是设计意图，但出图验证时要单独确认"方位词确实没了"，否则会误判成 bug。
 
@@ -675,31 +675,49 @@ D 长前缀(72 tok) + rich 相机(53) -> 2 chunks: 75 + 27
 
 居中之所以默认静默：SDXL 对"centered composition"的响应是把主体缩小到画面中央 40% 区域，正常中景会因此变弱；默认不发等于"不做额外干扰"，需要时再开。
 
-### 10.4 主体朝向 / 视线（`subject_yaw` + `gaze_mode`）—— 与机位解耦
+### 10.4 主体朝向 / 视线（`subject_yaw` + `gaze_mode`）—— 世界坐标系
 
-这是 v2 最容易被误用的部分：**机位（pos_x）决定"相机在哪"，subject_yaw 决定"人朝哪"**，两者互不推导。
+`subject_yaw` 是主体在**世界坐标系**里的朝向，与 `studio/web/camera3d.js` 的黄色箭头**同一套角度**（箭头朝 +Z 时 = 0，转 180° = ±1）。`pos_x` 是相机方位（0 正面、±1 背面），两者单位都是「1.0 = 180°」。判定前先求**相对相机的偏航角**：
 
-`|subject_yaw|` 分档（`FRAME_KEYS` 之外的 `SUBJECT_KEYS`）：
+```
+rel_yaw = wrap(subject_yaw - pos_x)        wrap(v) = ((v + 1) % 2 + 2) % 2 - 1
+```
 
-| 区间 | 档位 | 词条 | 实测权重 |
+| `|rel_yaw|` | 档位 | 词条 | 实测权重 |
 |---|---|---|---|
-| < 0.28 | `subject_front` | （正面机位时不发，避免与 front view 重复；背面机位下改发正面词） | — |
-| 0.28 – 0.72 | `subject_turn` | body turned three-quarters away from the camera | 1.12（yaw 0.45）/ 1.15（yaw 0.6） |
-| > 0.72 | `subject_away` | facing away, back turned to the camera | 1.19（yaw 0.9） |
+| < 0.28 | `subject_front` | front-facing body, shoulders square to the camera | 裸写（去重时整条不发） |
+| 0.28 – 0.72 | `subject_turn` | body turned three-quarters away from the camera | 1.12（0.45）/ 1.15（0.6） |
+| > 0.72 | `subject_away` | facing away, back turned to the camera | 1.19（0.9） |
 
-视线 `gaze_mode`（默认 `auto`，按朝向推导）：
+同一组参数在不同机位下的结论（`tests/test_core.py::test_world_yaw_geometry`）：
+
+| pos_x | subject_yaw | rel_yaw | subject | gaze（auto） |
+|---|---|---|---|---|
+| 0.0 | 0.0 | 0.0 | front（正面机位去重，不发词） | viewer |
+| 0.5 | 0.5 | 0.0 | front（去重不发） | viewer |
+| **1.0** | **0.0** | **−1.0** | **away（与 from behind 重复，不发 facing away）** | **away** |
+| **1.0** | **0.4** | **−0.6** | **turn** | **over_shoulder** |
+| 1.0 | −0.45 | 0.55 | turn | over_shoulder |
+| 0.0 | 0.9 | 0.9 | away（1.19） | away |
+
+两条去重规则（都是在 `compute_camera` 第 7 段里判的）：
+
+- `dup_front = subject == subject_front and front_az > 0.5` —— 正面机位再说 "front-facing body" 与 `front view` 重复；
+- `dup_back = subject == subject_away and behind_az > 0.45` —— 背面机位再说 "facing away" 与 `from behind / back view` 重复。
+
+视线 `gaze_mode`（默认 `auto`，用 `|rel_yaw|` 判定）：
 
 | 条件 | 档位 | 词条 | 权重 |
 |---|---|---|---|
-| `auto` + `|yaw| <= 0.72` | `gaze_viewer` | looking at viewer, direct eye contact | 1.00 裸写 |
-| `auto` + `0.28 < |yaw| <= 0.72` 且 `behind_ratio > 0.45` | `gaze_over_shoulder` | looking back over the shoulder at the viewer | 1.30 raw → **1.05** |
-| `auto` + `|yaw| > 0.72` | `gaze_away` | looking away, gaze averted | 1.00 裸写 |
+| `auto` + `|rel_yaw| < 0.28` | `gaze_viewer` | looking at viewer, direct eye contact | 1.00 裸写 |
+| `auto` + `0.28 <= |rel_yaw| <= 0.72` 且 `behind_ratio > 0.45` | `gaze_over_shoulder` | looking back over the shoulder at the viewer | 1.30 raw → **1.05** |
+| `auto` + `|rel_yaw| > 0.72` | `gaze_away` | looking away, gaze averted | 1.00 裸写 |
 | `camera`（强制） | `gaze_viewer` | 同上 | 1.00 |
 | `away`（强制） | `gaze_away` | 同上 | 1.00 |
 
 `behind_ratio` 是机位落在背面扇区的比例：只有"相机在身后 + 人半转身"才成立"回眸"，正面机位下不管 yaw 多大都不该发 over the shoulder。这条规则是被实测逼出来的 —— 正面机位硬发回眸，SDXL 会把人连同背景一起扭头。
 
-**背面机位 + `subject_yaw = 0` 的特例**：此时 gaze 是 `gaze_viewer` 而不是 over_shoulder。语义上"人面向镜头、相机在背后"是不可能的组合，实现选择让视线跟随显式参数，朝向交给机位词，不制造矛盾词条。
+**v2.1 修正**：早期实现把 `subject_yaw` 当成"相对相机的偏航角"，于是背面机位（`pos_x=1`）+ `subject_yaw=0` 会输出 `front-facing body` + `looking at viewer` —— 文字说"人正对镜头"，机位词说"相机在背后"，出图变成一张自相矛盾的半身像。现在统一到世界系，3D 视口箭头指哪、词条就是哪。老参数想保持原效果：相对角 `r` 换算成世界角 `wrap(r + pos_x)`。
 
 ### 10.5 极点消歧（|pos_y| > 0.75）
 
@@ -732,6 +750,20 @@ pole_gate(y) = clamp((1 - |y|) / 0.25, 0, 1)     # 极点区内整体衰减
 
 这张表是 v2 里唯一"靠实测反复修出来"的常量，改它必须跑 `tools/sweep_camera.py --mode elevation --tag v2` 重扫。
 
+**极点锁存 `POLE_LATCH`（v2.1）**
+
+`elevation_mode="3bin"` 只有 high / eye / low 三档，`pos_y=0.95` 也只给 `high angle shot` —— 出图是「稍高的平视」，
+不是真顶视。所以 v2.1 在 `|pos_y| > 0.9`（`POLE_LATCH`，严格大于）时把 high/low 升级成 bird/worm：
+
+| pos_y | 3bin 改前 | 3bin 改后（v2.1） | 5bin |
+|---|---|---|---|
+| 0.80 | high angle shot | high angle shot | high angle shot |
+| 0.90 | high angle shot | high angle shot（阈值本身不锁） | bird's-eye view |
+| 0.95 | high angle shot | bird's-eye view / top-down view / aerial shot / from above | bird |
+| 1.00 | high angle shot | 同上 + pole_gate=0 | 同上 |
+
+锁存后 `POLE_BLOCK_TOKENS["bird"]` 生效，方位段的 front view / facing the camera 会被剔除，视线走 `POLE_GAZE`。
+
 **视线改写 `POLE_GAZE`（`core/camera_core.py`，同步在 `js/camera_shared.js`）**
 
 屏蔽表把 "looking at viewer / direct eye contact" 从**方位**词里剔掉了，但视线段是独立生成的，py=0.95 仍会补上一句 "looking at viewer"，于是模型照样画一个正面站立的人像（实测 v2_pole_top：py=0.95 出的是背面回眸站姿，不是顶视）。修法是给极点区换视线短语，而不是删掉视线：
@@ -758,12 +790,29 @@ pole_gate(y) = clamp((1 - |y|) / 0.25, 0, 1)     # 极点区内整体衰减
 | `behind_ratio` | float | 机位在背面扇区的比例（回眸判据） |
 | `framing` | list[str] | 命中的构图档位 |
 | `subject` / `gaze` | str | 命中的朝向/视线档位 |
-| `subject_yaw` / `pan` | dict | 回显输入 |
+| `subject_yaw` | float | 回显输入（世界坐标系朝向） |
+| `rel_yaw` | float | `wrap(subject_yaw - pos_x)`，朝向/视线判定的真正依据 |
+| `pan` | list[float] | 回显输入 `[pan_x, pan_y]` |
+| `tokens` | dict | `{positive, negative, total, limit:75, warn:65, level}`，相机段 CLIP token 预算（`clip_tokens` 估算，≈4.5 字符/token） |
 | `bins` | list | `[[key, ratio, kind]]`，kind ∈ az/el/di/lens/tg/frame/subject/gaze |
 
 `bins` 带 kind 是 v2 的破坏性变更：老调用方按 `bins[i][0]` 取 key 仍然对，但"`bins` 只有方位"的假设不再成立（测试里用 `az_bins()` 过滤 `kind == "az"`）。
 
-### 10.7 v2 的 token 预算（真分词器实测）
+### 10.7 v2 的 token 预算（65 标黄 / 75 截断）
+
+相机段是**一段独立文字**，塞进用户的 prompt 头部，所以必须自己看着别超 Chunk 0 的 75 个内容 token（77 减去两个起止符）。三个地方用同一个口径：
+
+| 位置 | 实现 | 显示 |
+|---|---|---|
+| 节点内 3D 视口 | `js/sdxl_camera_widget.js:454` → `budgetOf(positive, negative)` | `44 / 75 tok · N 35`，>65 橙 `#d08b23`，>75 红 `#d0453a` |
+| Studio 前端 | `studio/web/app.js` 的 token 面板（优先用后端 `tokens.positive`） | 同上 |
+| Python / 后端 | `core/camera_core.py::clip_tokens` + `token_budget`；`studio/server.py` 在 `/api/preview` 的 `tokens` 里补 `limit/warn/level` | `tokens.level ∈ ok/warn/danger` |
+
+`clip_tokens` 是**零依赖估算**（不加载 CLIP 分词器）：先剥掉 `(tag:1.40)` 的权重语法，再按逗号切段、按空白切词，每词 `ceil(len*2/9)` 个 token。误差约 ±10%（"front view" 真分词 2、估算 3;整段 40 实测 vs 44 估算），用来判断"要不要收手"够用。要精确值：`studio/tools/e2e_test.py` 或后端在 ComfyUI python 下会切到真 `SDTokenizer`（`method="tokenizer"`）。
+
+实测参考（真分词器）：
+
+
 
 | 场景 | 正向 / 负向 token | 说明 |
 |---|---|---|
@@ -773,11 +822,14 @@ pole_gate(y) = clamp((1 - |y|) / 0.25, 0, 1)     # 极点区内整体衰减
 
 结论不变（§1.4）：相机段整体仍在 75 token 以内，一块够用；但**极点 + 长焦 + 构图 + 朝向同时开**会到 ~70，逼近边界，此时应关掉不用的轴（`strength` 不动，直接让对应参数归零）。
 
+**为什么相机段要盯着 75**：它和用户的 `extra_positive`、LoRA 触发词、画风词共用 Chunk 0。超了不是报错，是 CLIP 静默截断 —— 被截掉的往往正好是排在后面的 `gaze` / `lens` 这些"贵但不显眼"的词，于是"我明明设了 85mm 却没有虚化"。看到橙色就删词，别加词。
+
 ### 10.8 复跑
 
 ```bash
 cd D:/QUARK/sdxl_camera_angle
-PYTHONIOENCODING=utf-8 python tests/test_core.py          # 15 项单测
-PYTHONIOENCODING=utf-8 python tools/parity_check.py       # Python ↔ JS 常量逐字一致
+PYTHONIOENCODING=utf-8 python tests/test_core.py          # 17 项单测（含世界系 rel_yaw / token 预算）
+PYTHONIOENCODING=utf-8 python tools/parity_check.py       # Python ↔ JS 常量逐字一致（含 CLIP 阈值 65/75）
 PYTHONIOENCODING=utf-8 python tools/validate_workflow.py  # 工作流 widgets 与节点 INPUT_TYPES 对齐
+PYTHONIOENCODING=utf-8 python tools/sweep_camera.py --mode elevation --tag v2_fix   # 极点重扫（要 ComfyUI 在线）
 ```

@@ -1080,3 +1080,13 @@ input[type="file"]::file-selector-button:hover { border-color: var(--accent); co
   .token-parts { max-height: 118px; }
 }
 
+/* token 预算阈值（app.js paintTokenBadges 用；中性时不加类，保持默认色） */
+#token_total.tok-warn,
+#token_badge.tok-warn,
+.tk-warnline.tok-warn { color: #ffcf5c; }
+
+#token_total.tok-danger,
+#token_badge.tok-danger,
+.tk-warnline.tok-danger { color: #ff6b6b; font-weight: 600; }
+
+

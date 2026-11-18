@@ -18,7 +18,8 @@ for _p in (os.path.join(_ROOT, "core"), os.path.join(_ROOT, "tools")):
 from camera_core import (  # noqa: E402
     SDXL_TAGS, compute_camera, sdxl_weight, azimuth_bins, distance_key,
     elevation_key, az_gate, pole_gate, lens_key, focal_to_fov, framing_keys,
-    subject_keys, LENS_WEIGHT,
+    subject_keys, rel_yaw, clip_tokens, token_budget, LENS_WEIGHT,
+    CLIP_TOK_LIMIT, CLIP_TOK_WARN,
 )
 from presets import (  # noqa: E402
     PRESETS, PRESET_NAMES, PRESET_EXTRAS, SEQUENCES, preset_params,
@@ -251,12 +252,31 @@ def test_subject_gaze():
     assert out["camera_info"]["subject"] == "subject_front"
     assert "front-facing body" not in out["positive"], "正面机位不该重复朝向词"
     assert "looking at viewer" in out["positive"]
-    # 背面机位 + 主体正对镜头 = 回眸：from behind 与 front-facing body 并存
+    # 世界系朝向：相机在背后（pos_x=1）+ 人朝世界正面（yaw=0）→ 相对相机是背身
     out = pos(1.0, 0.0, 0.0, subject_yaw=0.0)
     toks = tokens_of(out["positive"])
-    assert "from behind" in toks and "front-facing body" in toks, "解耦失败"
-    # 主体正对（yaw≈0）时不算回眸，只保证朝向与机位解耦
-    assert out["camera_info"]["gaze"] == "gaze_viewer", out["camera_info"]["gaze"]
+    info = out["camera_info"]
+    assert "from behind" in toks, toks
+    assert "front-facing body" not in toks, "背面机位不该再说人正对镜头"
+    assert info["rel_yaw"] == -1.0, info["rel_yaw"]
+    assert info["subject"] == "subject_away", info["subject"]
+    assert info["gaze"] == "gaze_away", info["gaze"]
+    # 与 from behind/back view 重复，subject_away 不再重复发一遍
+    assert "facing away" not in toks, toks
+    assert "looking at viewer" not in toks
+
+    # 背面机位 + 人转 0.4（世界系）→ 相对 0.6 背身 3/4，过头看镜头
+    out = pos(1.0, 0.0, 0.0, subject_yaw=0.4)
+    info = out["camera_info"]
+    assert abs(info["rel_yaw"] - (-0.6)) < 1e-6, info["rel_yaw"]
+    assert info["subject"] == "subject_turn", info["subject"]
+    assert info["gaze"] == "gaze_over_shoulder", info["gaze"]
+    assert "(body turned three-quarters away from the camera:1.15)" in out["positive"], out["positive"]
+
+    # 正面机位 + 人朝前：仍是正对
+    out = pos(0.0, 0.0, 0.0, subject_yaw=0.0)
+    assert out["camera_info"]["rel_yaw"] == 0.0
+    assert out["camera_info"]["gaze"] == "gaze_viewer"
     # 转身 3/4 背对 + 背面机位 → 过头看镜头
     out = pos(1.0, 0.0, 0.0, subject_yaw=-0.45)
     assert out["camera_info"]["subject"] == "subject_turn"
@@ -273,8 +293,50 @@ def test_subject_gaze():
     # 主体朝向不影响机位方位词（解耦）
     a = pos(0.0, 0.0, 0.0, subject_yaw=0.9)["camera_info"]["bin"]
     assert a == "front"
-    print("[ok] 主体朝向/视线: 正面机位去重; 背面机位+正对=回眸(from behind + front-facing body); "
-          "yaw=-0.45 -> turn+over_shoulder(1.05); yaw=0.9 -> away+away(1.19)")
+    print("[ok] 主体朝向/视线: yaw 是世界系朝向, rel=wrap(yaw-pos_x); "
+          "背机位+yaw0 -> away+away(去重不发 facing away); 背机位+yaw0.4 -> turn+over_shoulder; "
+          "正面+正对去重; yaw=0.9 -> away(1.19)")
+
+
+# ══════════ 8b. CLIP token 预算 ══════════
+def test_token_budget():
+    out = pos(0.0, 0.0, 0.0, neg_strength=1.0)
+    tb = out["camera_info"]["tokens"]
+    assert tb["limit"] == 75 and tb["warn"] == 65, tb
+    assert tb["positive"] == clip_tokens(out["positive"]), tb
+    assert tb["negative"] == clip_tokens(out["negative"]), tb
+    assert tb["total"] == tb["positive"] + tb["negative"], tb
+    assert tb["level"] in ("ok", "warn", "danger"), tb
+    # 权重语法不额外计数
+    assert clip_tokens("(front view:1.40)") == clip_tokens("front view") == 3, clip_tokens("front view")
+    assert clip_tokens("") == 0
+    # 逐档判定：75 是上限，65 开始提示
+    assert token_budget("a" * 3)["level"] == "ok"
+    heavy = ", ".join(["subject placed on the left third"] * 8)
+    assert token_budget(heavy)["level"] == "warn", token_budget(heavy)
+    huge = ", ".join(["subject placed on the left third"] * 12)
+    assert token_budget(huge)["level"] == "danger", token_budget(huge)
+    assert CLIP_TOK_LIMIT == 75 and CLIP_TOK_WARN == 65
+    print("[ok] token 预算: 默认 %d tok(%s)；权重语法不计数；>65 标黄 >75 标红"
+          % (tb["total"], tb["level"]))
+
+
+def test_world_yaw_geometry():
+    # 相对角 = wrap(yaw - pos_x)：同一 yaw 在不同机位下结论不同
+    assert rel_yaw(0.0, 0.0) == 0.0
+    assert abs(rel_yaw(0.0, 1.0) + 1.0) < 1e-9
+    assert abs(rel_yaw(0.0, -1.0) + 1.0) < 1e-9
+    assert abs(rel_yaw(0.5, 0.5)) < 1e-9
+    assert abs(rel_yaw(0.4, 1.0) + 0.6) < 1e-9
+    # 环绕一圈：yaw 固定时，机位每转 0.25（45°）相对角就变 0.25
+    for px, want in ((0.0, 0.5), (0.25, 0.25), (-0.25, 0.75), (0.5, 0.0)):
+        got = rel_yaw(0.5, px)
+        assert abs(((got - want + 1.0) % 2.0) - 1.0) < 1e-9, (px, got, want)
+    # subject_keys 与 rel_yaw 同步：|rel|<0.28 正对、<0.72 转身、否则背对
+    assert subject_keys(0.0, 1.0)[0] == "subject_away"
+    assert subject_keys(0.5, 1.0)[0] == "subject_turn"
+    assert subject_keys(0.5, 0.5)[0] == "subject_front"
+    print("[ok] 世界系朝向: rel=wrap(yaw-pos_x)；yaw=0.5 在 pos_x=0.5 时正对、在 pos_x=1 时背对")
 
 
 # ══════════ 9. 极点互斥 ══════════
@@ -314,6 +376,17 @@ def test_pole_conflicts():
     # 非极点区保持原短语
     mid = tokens_of(pos(0.0, 0.5, 0.0)["positive"])
     assert "looking at viewer" in mid and "direct eye contact" in mid, mid
+
+    # 极点锁存（v2.1）：3bin 拖到底也要真顶视/真贴地，而不是"稍高的平视"
+    lat = tokens_of(pos(0.0, 0.95, 0.0)["positive"])
+    assert "bird's-eye view" in lat and "top-down view" in lat, lat
+    assert "high angle shot" not in lat, lat
+    floor = tokens_of(pos(0.0, -0.95, 0.0)["positive"])
+    assert "worm's-eye view" in floor and "from below" in floor, floor
+    assert "low angle shot" not in floor, floor
+    # 未到锁存阈值（0.9）仍是 3bin 的档位词
+    near = tokens_of(pos(0.0, 0.8, 0.0)["positive"])
+    assert "high angle shot" in near and "bird's-eye view" not in near, near
     print("[ok] 极点: py=1.0 5bin 无 from behind 且 azimuth_suppressed；py=0.8 冲突 token 被剔除；"
           "8 方位 × 9 俯仰 × 2 模式 = 144 组无互斥词；极点视线改 looking up/down at the viewer")
 
@@ -469,6 +542,8 @@ def main():
         test_roll,
         test_framing,
         test_subject_gaze,
+        test_token_budget,
+        test_world_yaw_geometry,
         test_pole_conflicts,
         test_negative,
         test_weight_range,

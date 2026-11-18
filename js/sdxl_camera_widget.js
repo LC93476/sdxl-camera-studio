@@ -3,6 +3,7 @@
  * 绑定节点 CameraAngleSDXL（widget 契约见 SPEC.md 2.6 / 第 7 节）。
  * 提示词算法全部来自 ./camera_shared.js（core/camera_core.py 的严格 JS 镜像），
  * Python 端是唯一权威；本文件只负责 3D 渲染、拖拽交互与即时预览。
+ * 渲染是按需的：只有状态或相机变化才画一帧（无 60FPS 常驻自循环）。
  */
 console.log("[SDXLCam] loading sdxl_camera_widget.js (v2 shared-algorithm)");
 import * as THREE from "./three.module.js";
@@ -11,6 +12,8 @@ import {
   computeCamera, V, NEG, PRESET_NAMES, presetParams,
   focalToFov, lensKey, r2, clamp,
 } from "./camera_shared.js";
+// 命名空间导入：budgetOf / clipTokens 若尚未导出，也不会让整个模块加载失败
+import * as SHARED from "./camera_shared.js";
 
 // ============================================================
 // 0. 显示用中文短名（算法侧无中文，纯 UI 文案）
@@ -27,6 +30,23 @@ const CN = {
   subject_front: "正对身体", subject_turn: "转身", subject_away: "背对",
   gaze_viewer: "看镜头", gaze_away: "移开视线", gaze_over_shoulder: "回眸",
 };
+
+// ---- token 预算：优先用 camera_shared.js 的实现；该导出尚未落地时用本地近似兜底 ----
+// 兜底口径与 studio/web/app.js 的 fallbackClipTokens 一致：按逗号切 tag、每词 1 token、长词(>6)记 2
+const _clipApprox = text => {
+  const s = String(text == null ? "" : text).trim();
+  if (!s) return 0;
+  let n = 0;
+  s.split(",").forEach(tag => {
+    tag.trim().split(/\s+/).forEach(w => { if (w) n += w.length > 6 ? 2 : 1; });
+  });
+  return n;
+};
+const clipTokens = SHARED.clipTokens || _clipApprox;
+const budgetOf = SHARED.budgetOf || ((positive, negative) => {
+  const p = clipTokens(positive), n = clipTokens(negative);
+  return { positive: p, negative: n, total: p + n, limit: 75, warn: 65 };
+});
 
 // pos_z → 距离档位中心（拖拽 / 滚轮吸附用，与 camera_core.distance_key 阈值对应）
 const DIST_GEARS = [0.85, 0.45, 0.10, -0.17, -0.52, -0.85]; // ecu cu medium cowboy full wide
@@ -73,6 +93,7 @@ const HOTKEYS = {
     ".sc-w .btn-r button:hover{background:#444}",
     ".sc-w .btn-r button.on{background:#4a3a6a;border-color:#8f7fe0;color:#fff}",
     ".sc-w .sc-bin{font-size:10px;font-family:monospace;color:#8fd6c0;background:rgba(0,0,0,0.28);border:1px solid #3a4a48;border-radius:4px;padding:2px 6px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}",
+    ".sc-w .sc-tok{font-size:9px;font-family:monospace;padding:0 6px;color:rgba(143,214,192,0.75);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}",
     ".sc-w .sc-bin2{font-size:9px;font-family:monospace;color:rgba(143,214,192,0.6);padding:0 6px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}",
     ".sc-w .pr{width:100%;min-height:26px;max-height:60px;resize:vertical;font-size:10px;background:rgba(0,0,0,0.25);border:1px solid #444;color:#fff3b7;border-radius:4px;padding:3px 5px;font-family:monospace;box-sizing:border-box;overflow-x:hidden;word-break:break-all}",
     ".sc-w .pr.neg{color:#b7c6ff;border-color:#39404f;min-height:22px}",
@@ -155,6 +176,7 @@ app.registerExtension({
         if (nw !== CW) {
           CW = nw; CH = Math.round(CW * 500 / 560);
           renderer.setSize(CW, CH, false); cam3d.aspect = CW / CH; cam3d.updateProjectionMatrix();
+          scheduleRender();
         }
       });
       ro.observe(container);
@@ -222,7 +244,7 @@ app.registerExtension({
       // 手柄 2：青弧 + 青点 = 高度
       const arcPts = [];
       for (let i = 0; i <= 32; i++) {
-        const a = (-30 + 90 * i / 32) * Math.PI / 180;
+        const a = (-78 + 156 * i / 32) * Math.PI / 180;
         arcPts.push(new THREE.Vector3(-0.8, EL_R * Math.sin(a) + CENTER.y, EL_R * Math.cos(a)));
       }
       const arc = new THREE.Mesh(new THREE.TubeGeometry(new THREE.CatmullRomCurve3(arcPts), 32, 0.04, 8, false), new THREE.MeshBasicMaterial({ color: 0x00FFD0, transparent: true, opacity: 0.8 }));
@@ -233,14 +255,20 @@ app.registerExtension({
       // 手柄 3：黄点 + 黄线 = 距离
       const distH = mkHandle(0xFFB800, 0xFFB800); scene.add(distH);
       const distG = mkGlow(0xFFB800); distG.material.opacity = 0.25; scene.add(distG);
-      let distTube = null;
+      // 距离连线：单位圆柱只建一次，之后只改 position / quaternion / scale.y（不再每帧 new + dispose）
+      const distTube = new THREE.Mesh(
+        new THREE.CylinderGeometry(0.025, 0.025, 1, 8, 1, true),
+        new THREE.MeshBasicMaterial({ color: 0xFFB800, transparent: true, opacity: 0.8 }));
+      scene.add(distTube);
+      const _tubeUp = new THREE.Vector3(0, 1, 0);
+      const _tubeDir = new THREE.Vector3();
 
       // ---- 状态 ----
       const S = {
         px: 0, py: 0, pz: 0, rv: 0,
         focal: 50, panx: 0, pany: 0, yaw: 0, gaze: "auto",
-        azimuth: 0, elevation: 15, dist: 5.5,
-        dragging: false, tgt: null, hovered: null, animId: null,
+        azimuth: 0, elevation: 0, dist: 5.5,
+        dragging: false, tgt: null, hovered: null, rafId: null, rafPending: false,
         gazeKey: "gaze_viewer", hoverCanvas: false, showGrid: true, showFrustum: true,
       };
       const VOCAB = Object.assign({}, V);       // 正向词表（标签面板 / _cfg_json 可覆盖）
@@ -248,7 +276,8 @@ app.registerExtension({
       let tagVer = 0;
 
       const azDeg = px => (px * 180 + 360) % 360;
-      const elDeg = py => py * 45 + 15;
+      // py=-1..1 → -78..78°（0 = 平视），与 core 的 pos_y 对称语义一致
+      const elDeg = py => py * 78;
       const distV = pz => pz * 4.5 + 5.5;
 
       function snapDist() {
@@ -314,6 +343,7 @@ app.registerExtension({
         const put = (k, v) => { const w = gw(k); if (w) w.value = v; };
         put("pos_x", S.px); put("pos_y", S.py); put("pos_z", S.pz); put("roll", S.rv);
         if (node.graph) node.graph.setDirtyCanvas(true, true);
+        markDirty();
       }
       /** 手动改姿态即视为自定义：清掉预设，避免 Python 用预设覆盖 */
       function markCustom() {
@@ -324,12 +354,25 @@ app.registerExtension({
         }
       }
 
+      // ---- 任意 widget 变化都标记重绘：按需渲染下 HUD 也不会滞后 ----
+      (function hookWidgets() {
+        (node.widgets || []).forEach(w => {
+          if (w._scHooked) return;
+          const oc = w.callback;
+          w.callback = function (v) {
+            if (oc) oc.apply(this, arguments);
+            readW(); markDirty();
+          };
+          w._scHooked = true;
+        });
+      })();
+
       readW();
-      setTimeout(() => { readW(); loadCfg(); refreshTags(); }, 220);
+      setTimeout(() => { readW(); loadCfg(); refreshTags(); markDirty(); }, 220);
       node.onConfigure = (function (o) {
         return function () {
           if (o) o.apply(this, arguments);
-          setTimeout(() => { readW(); loadCfg(); refreshTags(); }, 60);
+          setTimeout(() => { readW(); loadCfg(); refreshTags(); scheduleRender(); }, 60);
         };
       })(node.onConfigure);
 
@@ -337,6 +380,7 @@ app.registerExtension({
       const binEl = document.createElement("div"); binEl.className = "sc-bin";
       binEl.textContent = "front / eye / medium";
       const binEl2 = document.createElement("div"); binEl2.className = "sc-bin2";
+      const tokEl = document.createElement("div"); tokEl.className = "sc-tok"; tokEl.textContent = "— / 75 tok";
       const prevEl = document.createElement("textarea"); prevEl.className = "pr"; prevEl.readOnly = true; prevEl.rows = 2;
       const negEl = document.createElement("textarea"); negEl.className = "pr neg"; negEl.readOnly = true; negEl.rows = 2;
       const ph = document.createElement("div"); ph.className = "ph";
@@ -406,6 +450,13 @@ app.registerExtension({
         const r = computeCamera(S.px, S.py, S.pz, S.rv, opts());
         prevEl.value = r.positive;
         negEl.value = r.negative;
+        // token 预算：Chunk 0 看图的是正向段，故阈值只卡 positive（> 65 橙 / > 75 红），与 studio 一致
+        const bg = budgetOf(r.positive, r.negative) || {};
+        const pt = Math.round(Number(bg.positive) || 0), nt = Math.round(Number(bg.negative) || 0);
+        const lim = Math.round(Number(bg.limit) || 75), wn = Math.round(Number(bg.warn) || 65);
+        tokEl.textContent = pt + " / " + lim + " tok · N " + nt
+          + (pt > lim ? " · 超 Chunk 0 上限" : (pt > wn ? " · 接近上限" : ""));
+        tokEl.style.color = pt > lim ? "#d0453a" : (pt > wn ? "#d08b23" : "rgba(143,214,192,0.75)");
         const ib = r.info;
         binEl.textContent = (ib.bin || "—") + " / " + ib.elevation + " / " + ib.distance
           + (ib.dutch ? " / dutch" : "");
@@ -443,16 +494,20 @@ app.registerExtension({
         const dt = 0.15 + (10 - S.dist) / 10 * 0.7;
         distH.position.lerpVectors(CENTER, camCone.position, dt); distG.position.copy(distH.position);
 
-        if (distTube) { scene.remove(distTube); distTube.geometry.dispose(); distTube.material.dispose(); }
-        distTube = new THREE.Mesh(
-          new THREE.TubeGeometry(new THREE.LineCurve3(CENTER.clone(), camCone.position.clone()), 1, 0.025, 8, false),
-          new THREE.MeshBasicMaterial({ color: 0xFFB800, transparent: true, opacity: 0.8 }));
-        scene.add(distTube);
+        // 距离连线：只更新变换（position/quaternion/scale），几何体复用
+        _tubeDir.copy(camCone.position).sub(CENTER);
+        const tlen = _tubeDir.length();
+        distTube.visible = tlen > 1e-4;
+        if (distTube.visible) {
+          distTube.position.copy(CENTER).addScaledVector(_tubeDir, 0.5);
+          distTube.quaternion.setFromUnitVectors(_tubeUp, _tubeDir.normalize());
+          distTube.scale.set(1, tlen, 1);
+        }
 
         updateFrustum(new THREE.Vector3(cx, cy, cz));
 
         // 主体朝向箭头 + 视线锥（跟 subject_yaw / gaze_mode 转）
-        const yawTh = S.yaw * Math.PI / 2;
+        const yawTh = S.yaw * Math.PI;   // subject_yaw ±1 → ±180°，与 core 世界系一致
         const fwd = new THREE.Vector3(Math.sin(yawTh), 0, Math.cos(yawTh));
         subjArrow.position.set(0, 0.03, 0); subjArrow.setDirection(fwd);
         const head = new THREE.Vector3(0, CENTER.y + 0.45, 0);
@@ -477,15 +532,18 @@ app.registerExtension({
         updatePreview();
       }
 
+      // ---- 按需渲染：状态或相机变化才画一帧，没有常驻自循环 ----
       let alive = true;
-      function anim() {
+      function renderOnce() {
         if (!alive) return;
-        S.animId = requestAnimationFrame(anim);
-        gr.rotation.z += 0.005;
-        try { renderer.render(scene, cam3d); } catch (_) {}
-        upd();
+        try { upd(); renderer.render(scene, cam3d); } catch (_) {}
       }
-      requestAnimationFrame(anim);
+      function scheduleRender() {
+        if (!alive || S.rafPending) return;
+        S.rafPending = true;
+        S.rafId = requestAnimationFrame(() => { S.rafPending = false; S.rafId = null; renderOnce(); });
+      }
+      function markDirty() { scheduleRender(); }
 
       // ---- 鼠标交互 ----
       const ray = new THREE.Raycaster(), mouse = new THREE.Vector2();
@@ -499,7 +557,7 @@ app.registerExtension({
         mouse.y = -(e.clientY - r.top) / r.height * 2 + 1;
         ray.setFromCamera(mouse, cam3d);
         for (const h of hList) {
-          if (ray.intersectObject(h.m).length > 0) { S.dragging = true; S.tgt = h.n; setScale(h, 1.3); e.preventDefault(); return; }
+          if (ray.intersectObject(h.m).length > 0) { S.dragging = true; S.tgt = h.n; setScale(h, 1.3); scheduleRender(); e.preventDefault(); return; }
         }
       });
       canvas.addEventListener("pointermove", e => {
@@ -512,6 +570,7 @@ app.registerExtension({
           for (const h of hList) if (ray.intersectObject(h.m).length > 0) { f = h; break; }
           if (S.hovered && S.hovered !== f) setScale(S.hovered, 1.0);
           if (f) { setScale(f, 1.15); S.hovered = f; } else S.hovered = null;
+          scheduleRender();
           return;
         }
         const plane = new THREE.Plane(), pt = new THREE.Vector3();
@@ -527,8 +586,8 @@ app.registerExtension({
           plane.setFromNormalAndCoplanarPoint(new THREE.Vector3(1, 0, 0), new THREE.Vector3(-0.8, 0, 0));
           if (ray.ray.intersectPlane(plane, pt)) {
             let a = Math.atan2(pt.y - CENTER.y, pt.z) * 180 / Math.PI;
-            a = Math.max(-30, Math.min(60, a));
-            S.elevation = a; S.py = r2((a - 15) / 45);
+            a = Math.max(-78, Math.min(78, a));
+            S.elevation = a; S.py = r2(a / 78);
             markCustom(); syncN();
           }
         } else if (S.tgt === "dist") {
@@ -581,11 +640,11 @@ app.registerExtension({
       }
       function toggleGrid() {
         S.showGrid = !S.showGrid; vf.classList.toggle("on", S.showGrid);
-        gridBtn.classList.toggle("on", S.showGrid);
+        gridBtn.classList.toggle("on", S.showGrid); scheduleRender();
       }
       function toggleFrustum() {
         S.showFrustum = !S.showFrustum; frustumLines.visible = S.showFrustum;
-        frBtn.classList.toggle("on", S.showFrustum);
+        frBtn.classList.toggle("on", S.showFrustum); scheduleRender();
       }
       const onKey = e => {
         const tag = (e.target && e.target.tagName || "").toUpperCase();
@@ -698,10 +757,13 @@ app.registerExtension({
       // ---- 底部：档位 + 预览 ----
       container.appendChild(binEl);
       container.appendChild(binEl2);
+      container.appendChild(tokEl);
       container.appendChild(prevEl);
       container.appendChild(negEl);
       ph.textContent = "预览 → 正向 / 负向（Python 端为准）";
       container.appendChild(ph);
+
+      scheduleRender();   // 首帧
 
       // ---- 清理 ----
       const domWidget = node.widgets?.find(w => w.name === "cam3d");
@@ -709,8 +771,10 @@ app.registerExtension({
         const baseRO = domWidget.onRemove;
         domWidget.onRemove = function () {
           alive = false;
-          if (S.animId) cancelAnimationFrame(S.animId);
+          if (S.rafId) cancelAnimationFrame(S.rafId);
+          S.rafPending = false; S.rafId = null;
           try { ro.disconnect(); } catch (_) {}
+          try { distTube.geometry.dispose(); distTube.material.dispose(); } catch (_) {}
           try { window.removeEventListener("wheel", onWheel, { capture: true }); } catch (_) {}
           try { window.removeEventListener("keydown", onKey); } catch (_) {}
           try { renderer.dispose(); } catch (_) {}

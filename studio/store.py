@@ -85,8 +85,34 @@ def ensure_dirs():
     return {"state": str(STATE_DIR), "out": str(OUT_DIR)}
 
 
+def _dump(fh, data):
+    json.dump(data, fh, ensure_ascii=False, indent=2, sort_keys=True)
+    fh.flush()
+    try:
+        os.fsync(fh.fileno())
+    except OSError:
+        pass
+
+
+def _write_hint(path, err):
+    """写不进去时给一句能照着做的提示。
+
+    Windows 上最常见的原因不是磁盘满，而是「进程完整性级别」：
+    ComfyUI 便携版自带的 python.exe 是**低完整性**进程（S-1-16-4096），
+    只能写标了低完整性标签的目录；目标目录没有标签就会被拒绝（EACCES）。
+    修法见 README「写不进 state / out 目录」。
+    """
+    return ("写不进 %s（%s）。若启动用的是 ComfyUI 便携版 python，"
+            "多半是低完整性标签问题：对项目目录执行 "
+            "icacls \"<项目目录>\" /setintegritylevel (OI)(CI)L 后重开服务。" % (path, err))
+
+
 def atomic_write_json(path, data):
-    """临时文件 + os.replace；同目录建临时文件，保证跨盘也不出错。"""
+    """临时文件 + os.replace；同目录建临时文件，保证跨盘也不出错。
+
+    临时文件被拒（EACCES/EPERM/EROFS）时退化成直接写目标文件：
+    先保住数据，再往上抛可读的错误，而不是丢一个裸 traceback 给前端。
+    """
     path = Path(path)
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -95,19 +121,24 @@ def atomic_write_json(path, data):
     tmp = path.parent / ("%s.%s.tmp" % (path.name, uuid.uuid4().hex[:8]))
     try:
         with open(tmp, "w", encoding="utf-8") as fh:
-            json.dump(data, fh, ensure_ascii=False, indent=2, sort_keys=True)
-            fh.flush()
-            try:
-                os.fsync(fh.fileno())
-            except OSError:
-                pass
+            _dump(fh, data)
         os.replace(str(tmp), str(path))
+        return path
+    except OSError as err:
+        if getattr(err, "errno", None) not in (13, 1, 30, None):
+            raise
+        tmp_error = err
     finally:
         try:
             if tmp.exists():
                 tmp.unlink()
         except OSError:
             pass
+    try:
+        with open(path, "w", encoding="utf-8") as fh:
+            _dump(fh, data)
+    except OSError as err:
+        raise StoreWriteError(_write_hint(path, err)) from err
     return path
 
 
@@ -165,6 +196,10 @@ def _sanitize(defaults, data):
     return out
 
 
+class StoreWriteError(OSError):
+    """state/out 目录不可写：带人话提示，前端可以直接显示。"""
+
+
 # ══════════════════════ config ══════════════════════
 def load_config():
     """返回完整配置（与 DEFAULT_CONFIG 同键集）。"""
@@ -175,7 +210,7 @@ def save_config(config):
     """整份保存，返回落盘后的配置。"""
     cfg = _sanitize(DEFAULT_CONFIG, config)
     ensure_dirs()
-    atomic_write_json(CONFIG_PATH, cfg)
+    atomic_write_json(CONFIG_PATH, cfg)  # 失败抛 StoreWriteError（带提示）
     return cfg
 
 

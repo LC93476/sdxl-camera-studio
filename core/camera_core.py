@@ -26,6 +26,7 @@ AZ_POLE = 0.9
 POLE_DEG = 75.0
 POLE_NORM = POLE_DEG / 90.0
 POLE_START = 0.75          # 从此处开始线性衰减，1.0 处归零
+POLE_LATCH = 0.9           # |pos_y| 超过这里就把 3bin 的 high/low 升级成 bird/worm（真顶视/真贴地）
 AZ_SUPPRESS = 0.12         # 有效方位强度低于此值直接丢弃方位词
 
 # ── 档位定义 ────────────────────────────────────────────
@@ -60,8 +61,9 @@ SDXL_TAGS = {
     "high": "high angle shot, from above",
     "eye": "eye level shot",
     "low": "low angle shot, from below, looking up",
-    "bird": "from above, high angle, looking down at viewer, top-down view",
-    "worm": "from below, low angle, looking up at viewer",
+    # 极点高度：只描述机位（不含 "looking down/up at viewer"，视线交给 POLE_GAZE）
+    "bird": "bird's-eye view, top-down view, aerial shot, from above",
+    "worm": "worm's-eye view, extreme low angle, from below",
     # 距离
     "ecu": "extreme close-up, macro shot",
     "cu": "close-up, portrait shot",
@@ -105,8 +107,8 @@ SDXL_TAGS = {
         "high": "low angle shot, from below, looking up",
         "low": "high angle shot, from above",
         "eye": "high angle, low angle",
-        "bird": "worm's-eye view, extreme low angle",
-        "worm": "bird's-eye view, top-down shot",
+        "bird": "worm's-eye view, extreme low angle, from below",
+        "worm": "bird's-eye view, top-down view, from above",
         "ecu": "wide shot, full body",
         "cu": "wide shot, full body, distant",
         "medium": "close-up, extreme close-up",
@@ -370,9 +372,31 @@ def framing_keys(pan_x, pan_y):
     return out
 
 
+def wrap_yaw(v):
+    """角度折半圈：1.0 = 180°，结果落在 [-1, 1)。"""
+    v = _clamp(v, -3.0, 3.0)
+    return ((v + 1.0) % 2.0) - 1.0
+
+
+def rel_yaw(subject_yaw, pos_x):
+    """主体相对相机的偏航角（世界坐标系求差）。
+
+    subject_yaw 是主体在**世界坐标系**里的朝向（0 = 面向世界 +Z，±1 = 背向），
+    pos_x 是相机方位（0 = 正面机位，±1 = 背面机位），两者同一套角度单位。
+    相机绕主体转 pos_x 等价于主体相对相机反向转 pos_x：
+        rel = wrap(subject_yaw - pos_x)
+    因此 pos_x=1（相机在背后）+ subject_yaw=0（人朝世界正面）→ rel=±1 背身。
+    """
+    return wrap_yaw(_clamp(subject_yaw, -1, 1) - _clamp(pos_x, -1, 1))
+
+
 def subject_keys(subject_yaw, pos_x, gaze_mode="auto"):
-    """主体朝向 / 视线（与机位解耦）。返回 (subject_key|None, gaze_key|None, ratio)。"""
-    yaw = _clamp(subject_yaw, -1, 1)
+    """主体朝向 / 视线。返回 (subject_key|None, gaze_key|None, ratio)。
+
+    主体朝向用**相对相机的偏航角** rel_yaw 判定，所以同一个世界系 yaw 在不同机位下
+    会得到 front / turn / away 的不同结论 —— 这也是 3D 视口的箭头语义。
+    """
+    yaw = rel_yaw(subject_yaw, pos_x)
     mag = abs(yaw)
     if mag < 0.28:
         skey, sratio = "subject_front", 1.0
@@ -484,6 +508,10 @@ def compute_camera(pos_x=0.0, pos_y=0.0, pos_z=0.0, roll=0.0, **opts):
 
     # ── 2. 高度 ──
     ekey = elevation_key(py, el_mode)
+    # 极点锁存：3bin 模式在 |py| 接近端点时只给 high/low，出图是"稍高的平视"而不是真的顶视。
+    # 到 POLE_LATCH 就把档位升级成 bird/worm —— 用户把高度拖到底，就该看到正上方/正下方。
+    if abs(py) > POLE_LATCH and ekey in ("high", "low"):
+        ekey = "bird" if py > 0 else "worm"
     el_cfg = weights["elevation"]
     if el_cfg.get("enabled", True):
         eraw = 1.0 if ekey == "eye" else abs(py) * float(el_cfg.get("mult", 10.0))
@@ -530,13 +558,20 @@ def compute_camera(pos_x=0.0, pos_y=0.0, pos_z=0.0, roll=0.0, **opts):
     # ── 7. 主体朝向 / 视线 ──
     s_cfg = weights["subject"]
     skey, gkey, sratio = subject_keys(subject_yaw, px, gaze_mode)
+    rel = rel_yaw(subject_yaw, px)
     front_az = 0.0
+    behind_az = 0.0
     for key, ratio in azimuth_bins(px):
         if key == "front":
             front_az = ratio
+        elif key in ("back", "back_left", "back_right"):
+            behind_az += ratio
     if s_cfg.get("enabled", True):
-        # 机位在正面且主体也正对时，"front-facing body" 与方位词重复，跳过
-        if sratio > 0 and not (skey == "subject_front" and front_az > 0.5):
+        # 去重两条：机位正面且主体正对 → "front-facing body" 与 front view 重复；
+        # 机位在背后且主体背对 → "facing away" 与 from behind/back view 重复。
+        dup_front = skey == "subject_front" and front_az > 0.5
+        dup_back = skey == "subject_away" and behind_az > 0.45
+        if sratio > 0 and not dup_front and not dup_back:
             sraw = 1 + float(s_cfg.get("slope", 2.0)) * (0.0 if skey == "subject_front" else sratio)
             push("subject", skey, sratio, sraw, sdxl_weight(sraw, strength, curve))
         graw = 1.30 if gkey == "gaze_over_shoulder" else 1.0
@@ -612,7 +647,9 @@ def compute_camera(pos_x=0.0, pos_y=0.0, pos_z=0.0, roll=0.0, **opts):
         "subject": skey,
         "gaze": gkey,
         "subject_yaw": round(subject_yaw, 3),
+        "rel_yaw": round(rel, 3),
         "pan": [round(pan_x, 3), round(pan_y, 3)],
+        "tokens": token_budget(positive, negative),
         "preset": str(opts.get("preset") or "自定义"),
         "strength": round(strength, 3),
         "weight_mode": curve,
@@ -643,3 +680,71 @@ def _strip_weight(token):
         except ValueError:
             return text
     return text
+
+# ══════════════════════ CLIP token 预算 ══════════════════════
+CLIP_TOK_LIMIT = 75     # Chunk 0 上限：75 个内容 token（77 减去两个起止符）
+CLIP_TOK_WARN = 65      # 到这儿再往里塞词就会被截断，提示收手
+
+
+def plain_tags(text):
+    """去掉权重语法："(front view:1.40)" → "front view"（非权重的括号原样保留）。"""
+    s = str(text or "")
+    out = []
+    i = 0
+    n = len(s)
+    while i < n:
+        ch = s[i]
+        if ch == "(":
+            j = s.find(")", i + 1)
+            if j < 0:
+                out.append(s[i + 1:])
+                break
+            inner = s[i + 1:j]
+            head, sep, tail = inner.rpartition(":")
+            if sep:
+                try:
+                    float(tail)
+                    inner = head
+                except (TypeError, ValueError):
+                    pass
+            out.append(inner)
+            i = j + 1
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def clip_tokens(text):
+    """CLIP BPE 近似计数：按逗号切段，按空白切词，每词 ceil(len*2/9)（≈4.5 字符/token）。
+
+    不加载真分词器（前端 / 节点预览要零依赖），误差约 ±10%，够用来判断超没超 75。
+    """
+    if not text:
+        return 0
+    total = 0
+    for seg in plain_tags(text).split(","):
+        for word in seg.split():
+            w = word.strip("()[]{}:;.!?")
+            if not w:
+                continue
+            total += max(1, -(-len(w) * 2 // 9))
+    return total
+
+
+def token_budget(positive, negative=""):
+    """相机段 token 预算：{positive, negative, total, limit, warn, level}。
+
+    level: "ok" | "warn"（>65 标黄）| "danger"（>75 标红，Chunk 0 会截断）。
+    """
+    p = clip_tokens(positive)
+    n = clip_tokens(negative)
+    total = p + n
+    if total > CLIP_TOK_LIMIT:
+        level = "danger"
+    elif total > CLIP_TOK_WARN:
+        level = "warn"
+    else:
+        level = "ok"
+    return {"positive": p, "negative": n, "total": total,
+            "limit": CLIP_TOK_LIMIT, "warn": CLIP_TOK_WARN, "level": level}
