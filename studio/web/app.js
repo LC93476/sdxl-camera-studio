@@ -32,6 +32,11 @@ const API = {
   interrupt: '/api/interrupt',
   openFolder: '/api/open_folder',
   progress: (promptId) => '/api/progress?prompt_id=' + encodeURIComponent(promptId),
+  controlnetUpload: '/api/controlnet/upload',
+  templates: '/api/templates',
+  templatesInspect: '/api/templates/inspect',
+  batch: '/api/batch',
+  batchGet: (batchId) => '/api/batch?batch_id=' + encodeURIComponent(batchId),
 };
 
 const $ = (id) => document.getElementById(id);
@@ -79,6 +84,11 @@ const DEFAULTS = {
   seed: -1, randomize: true, steps: 28, cfg: 5, width: 1024, height: 1024,
   checkpoint: '', lora: '', lora_strength: 1,
   workflow_template: '', pose_id: '',
+  // v2.3：ControlNet 导出 / 模板嗅探 / 批量队列
+  cn_auto_inject: true, cn_kind: 'depth', cn_strength: 1,
+  cn_depth_file: '', cn_pose_file: '',
+  template: '',
+  batch_name: '三视图', batch_seed: 12345, batch_same_seed: true,
 };
 
 const ENUM_FALLBACK = {
@@ -296,6 +306,9 @@ function genPayload() {
     lora_strength: num(S.lora_strength, 1),
     workflow_template: S.workflow_template || '',
     pose_id: (S.pose_id || '').trim(),
+    // v2.3：可选工作流模板（template_select）+ 已上传的 ControlNet 图
+    template: S.template || '',
+    template_vars: controlnetVars(),
   };
 }
 
@@ -531,7 +544,18 @@ function scheduleConfigSave() {
 }
 
 async function saveConfig() {
-  const body = Object.assign({}, cameraPayload(), genPayload());
+  const body = Object.assign({}, cameraPayload(), genPayload(), {
+    // v2.3 面板状态：模板选择 + ControlNet + 批量队列默认值（都只是 UI 偏好）
+    template: S.template || '',
+    cn_auto_inject: !!S.cn_auto_inject,
+    cn_kind: S.cn_kind || 'depth',
+    cn_strength: clamp(num(S.cn_strength, 1), 0, 2),
+    cn_depth_file: S.cn_depth_file || '',
+    cn_pose_file: S.cn_pose_file || '',
+    batch_name: S.batch_name || '三视图',
+    batch_seed: Math.trunc(num(S.batch_seed, 12345)),
+    batch_same_seed: S.batch_same_seed !== false,
+  });
   try {
     await postJSON(API.config, body);
   } catch (_) {
@@ -564,7 +588,7 @@ function applyConfig(raw) {
     const key = k === 'lora_name' ? 'lora' : k;
     if (!(key in DEFAULTS)) return;
     const v = flat[k];
-    if (key === 'randomize') S[key] = !!v;
+    if (key === 'randomize' || key === 'cn_auto_inject' || key === 'batch_same_seed') S[key] = !!v;
     else if (typeof DEFAULTS[key] === 'number') S[key] = num(v, DEFAULTS[key]);
     else S[key] = v == null ? DEFAULTS[key] : String(v);
   });
@@ -1278,6 +1302,612 @@ async function runSequence() {
   }
 }
 
+// ─────────────── v2.3：ControlNet 导出 / 模板嗅探 / 批量队列 ───────────────
+//
+// 三条线共用一套原则：控件永远可用，后端离线只在对应面板里说中文错误，不打断页面。
+//   · ControlNet：3D 场景离屏导出 depth / pose → POST /api/controlnet/upload → filename 进 template_vars
+//   · 模板嗅探：GET /api/templates 填下拉 → POST /api/templates/inspect → 结构化报告
+//   · 批量队列：POST /api/batch → 900ms GET /api/batch → batch_grid 并排卡片
+
+const CN_W = 512;
+const CN_H = 768;
+
+let cnFiles = { depth: '', pose: '' };
+let tplItems = [];
+let batchTimer = 0;
+let batchId = '';
+let batchLabel = '';
+let batchRunning = false;
+
+/** 取 3D 核心实例：camera3d.js 可能挂 window.__rig，本文件也把同一实例挂上去 */
+function currentRig() {
+  if (window.__rig && typeof window.__rig === 'object') return window.__rig;
+  return rig || null;
+}
+
+function setCnStatus(text, kind) {
+  const el = $('cn_status');
+  if (!el) return;
+  el.textContent = text;
+  el.classList.toggle('err', kind === 'err');
+  el.classList.toggle('ok', kind === 'ok');
+}
+
+function setBatchStatus(text, kind) {
+  const el = $('batch_status');
+  if (!el) return;
+  el.textContent = text;
+  el.classList.toggle('err', kind === 'err');
+  el.classList.toggle('ok', kind === 'ok');
+}
+
+/** 导出 + 上传；只走共享 3D 核心的离屏导出，前端不再自建渲染路径（两条口径会不一致） */
+async function exportControlNet(kind) {
+  const btn = $(kind === 'depth' ? 'btn_depth_export' : 'btn_pose_export');
+  const img = $(kind === 'depth' ? 'depth_preview' : 'pose_preview');
+  const r = currentRig();
+  if (!r) {
+    setCnStatus('3D 未就绪：左侧视口没起来（刷新页面重试）', 'err');
+    return;
+  }
+  const native = kind === 'depth' ? r.renderDepthDataURL : r.renderPoseDataURL;
+  if (typeof native !== 'function') {
+    setCnStatus('3D 未就绪：当前 CameraRig 没有 ' + (kind === 'depth' ? 'renderDepthDataURL' : 'renderPoseDataURL') + '，换带离屏导出的版本', 'err');
+    return;
+  }
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = '导出中…';
+  }
+  try {
+    const dataUrl = kind === 'depth'
+      ? native.call(r, CN_W, CN_H, { invert: true })
+      : native.call(r, CN_W, CN_H);
+    if (!dataUrl || String(dataUrl).indexOf('data:image') !== 0) {
+      throw new Error('导出结果不是 data:image（3D 核心返回 ' + (dataUrl ? typeof dataUrl : '空') + '）');
+    }
+    if (img) {
+      img.src = dataUrl;
+      img.hidden = false;
+    }
+    setCnStatus('已生成 ' + CN_W + '×' + CN_H + ' ' + (kind === 'depth' ? '深度图' : '骨架图') + '，上传中…');
+
+    const res = await postJSON(API.controlnetUpload, { kind: kind, data_url: dataUrl });
+    const name = res && res.filename ? String(res.filename) : '';
+    if (!name) throw new Error('后端未返回 filename');
+    cnFiles[kind] = name;
+    if (kind === 'depth') S.cn_depth_file = name;
+    else S.cn_pose_file = name;
+
+    const bytes = res && res.bytes != null ? num(res.bytes, 0) : 0;
+    const sizeText = bytes >= 1024 ? (bytes / 1024).toFixed(1) + ' KB' : bytes + ' B';
+    setCnStatus('已上传 ' + name + ' · ' + sizeText + (S.cn_auto_inject ? ' · 下次生成自动注入' : ' · 自动注入已关闭'), 'ok');
+    setBadge('cn', kind === 'depth' ? '深度就绪' : '骨架就绪');
+    scheduleConfigSave();
+  } catch (err) {
+    setCnStatus('导出失败：' + err.message, 'err');
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = kind === 'depth' ? '导出深度' : '导出骨架';
+    }
+  }
+}
+
+/** 生成时要带的 ControlNet 变量（自动注入关闭时是空对象） */
+function controlnetVars() {
+  const out = {};
+  if (!S.cn_auto_inject) return out;
+  const kind = S.cn_kind || 'depth';
+  const wantDepth = kind === 'depth' || kind === 'both';
+  const wantPose = kind === 'pose' || kind === 'both';
+  if (wantDepth && cnFiles.depth) out.controlnet_depth = cnFiles.depth;
+  if (wantPose && cnFiles.pose) out.controlnet_pose = cnFiles.pose;
+  if (out.controlnet_depth || out.controlnet_pose) {
+    out.controlnet_strength = clamp(num(S.cn_strength, 1), 0, 2);
+  }
+  return out;
+}
+
+// ── 模板嗅探 ──
+
+function nodeBrief(v) {
+  if (v == null || v === '') return '—';
+  if (Array.isArray(v)) {
+    if (!v.length) return '—';
+    return v.map(nodeBrief).join(' / ');
+  }
+  if (typeof v === 'string' || typeof v === 'number') return String(v);
+  if (typeof v === 'object') {
+    const id = v.node != null ? v.node : (v.id != null ? v.id : '');
+    const field = v.field != null ? v.field : (v.input != null ? v.input : '');
+    return (id === '' ? '—' : '#' + id) + (field ? ' · ' + field : '');
+  }
+  return String(v);
+}
+
+function tplListFrom(data) {
+  if (Array.isArray(data)) return data;
+  if (data && Array.isArray(data.templates)) return data.templates;
+  if (data && data.templates && typeof data.templates === 'object') {
+    return Object.keys(data.templates).map((k) => {
+      const t = data.templates[k];
+      return Object.assign({ id: k }, (t && typeof t === 'object') ? t : {});
+    });
+  }
+  return [];
+}
+
+function tplIdOf(t) {
+  if (!t) return '';
+  return String(t.id || t.name || t.path || '');
+}
+
+function fillTemplatePicker(items) {
+  const sel = $('template_select');
+  if (!sel) return;
+  const list = Array.isArray(items) ? items : [];
+  sel.textContent = '';
+  const none = document.createElement('option');
+  none.value = '';
+  none.textContent = '（不了模板：走内置最小图）';
+  sel.appendChild(none);
+  list.forEach((t) => {
+    if (!t) return;
+    const id = tplIdOf(t);
+    if (!id) return;
+    // 后端 list_templates 的 nodes 是数字；也有 node_list 清单的实现，两种都认
+    const nodes = Array.isArray(t.node_list) ? t.node_list.length : (Math.trunc(num(t.nodes, 0)) || Math.trunc(num(t.node_count, 0)));
+    const o = document.createElement('option');
+    o.value = id;
+    o.textContent = (t.title ? String(t.title) : id) + (nodes ? ' · ' + nodes + ' 节点' : '') + (t.valid === false ? ' · 不可用' : '');
+    if (t.path) o.title = String(t.path);
+    sel.appendChild(o);
+  });
+  const want = String(S.template || '');
+  const hasWant = list.some((t) => tplIdOf(t) === want);
+  sel.value = hasWant ? want : '';
+  S.template = sel.value;
+  setBadge('tpl', sel.value ? '已选模板' : '未选模板');
+}
+
+async function loadTemplates() {
+  let items = [];
+  try {
+    const data = await api(API.templates);
+    items = tplListFrom(data);
+  } catch (_) {
+    items = tplListFrom(meta && meta.templates);
+  }
+  tplItems = items;
+  fillTemplatePicker(items);
+  return items;
+}
+
+function appendRepLine(box, text, kind) {
+  const p = document.createElement('div');
+  p.className = 'rep-warn' + (kind === 'err' ? ' err' : '');
+  p.textContent = text;
+  box.appendChild(p);
+}
+
+function renderTemplateReport(data, ref) {
+  const box = $('template_report');
+  if (!box) return;
+  const d = data || {};
+  const sniff = (d.sniff && typeof d.sniff === 'object') ? d.sniff : {};
+  // 后端 nodes 是数字（节点总数），node_list 才是清单；两种都兜住
+  const nodeCount = Math.trunc(num(d.nodes, 0)) ||
+    (Array.isArray(d.node_list) ? d.node_list.length : 0) ||
+    (Array.isArray(d.nodes) ? d.nodes.length : 0);
+  const cn = (sniff.controlnet && typeof sniff.controlnet === 'object') ? sniff.controlnet : {};
+  const depth = Array.isArray(cn.depth) ? cn.depth : [];
+  const pose = Array.isArray(cn.pose) ? cn.pose : [];
+  const warn = Array.isArray(d.warn) ? d.warn : [];
+
+  box.textContent = '';
+  // ok:false 是 200 里的软失败（模板读不了 / 解析炸了），直接把后端原话放出来
+  if (d.ok === false) {
+    appendRepLine(box, '嗅探失败：' + String(d.error || '后端没说原因'), 'err');
+    warn.forEach((w) => appendRepLine(box, String(w), 'err'));
+    setBadge('tpl', '嗅探失败');
+    return;
+  }
+
+  const camList = Array.isArray(sniff.camera) ? sniff.camera : (sniff.camera ? [sniff.camera] : []);
+  const rows = [
+    ['模板', String(d.template || ref || '—') + (nodeCount ? ' · ' + nodeCount + ' 个节点' : ' · 节点数未知')],
+    ['CameraAngleSDXL', camList.length ? '有 · ' + nodeBrief(camList) : '无（用 KSampler 的 CLIPTextEncode）'],
+    ['正向提示词节点', nodeBrief(sniff.positive)],
+    ['负向提示词节点', nodeBrief(sniff.negative)],
+    ['采样器', nodeBrief(sniff.sampler)],
+    ['Latent', nodeBrief(sniff.latent)],
+    ['保存节点', nodeBrief(sniff.save)],
+    ['ControlNet 深度槽', depth.length ? depth.map(nodeBrief).join(' / ') : '无'],
+    ['ControlNet 骨架槽', pose.length ? pose.map(nodeBrief).join(' / ') : '无'],
+  ];
+
+  box.textContent = '';
+  const dl = document.createElement('dl');
+  dl.className = 'rep-list';
+  rows.forEach((pair) => {
+    const dt = document.createElement('dt');
+    dt.textContent = pair[0];
+    const dd = document.createElement('dd');
+    dd.textContent = pair[1];
+    dl.appendChild(dt);
+    dl.appendChild(dd);
+  });
+  box.appendChild(dl);
+
+  if (warn.length) {
+    const ul = document.createElement('ul');
+    ul.className = 'rep-warn';
+    warn.forEach((w) => {
+      const li = document.createElement('li');
+      li.textContent = String(w);
+      ul.appendChild(li);
+    });
+    box.appendChild(ul);
+  } else {
+    const p = document.createElement('div');
+    p.className = 'rep-ok';
+    p.textContent = '没有警告：注入点齐全。';
+    box.appendChild(p);
+  }
+  setBadge('tpl', '已嗅探');
+}
+
+async function inspectTemplate() {
+  const sel = $('template_select');
+  const ref = sel ? sel.value : '';
+  const box = $('template_report');
+  if (!ref) {
+    if (box) box.textContent = '先在上面下拉里选一条工作流，再点「嗅探节点」。';
+    return;
+  }
+  const btn = $('btn_template_inspect');
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = '嗅探中…';
+  }
+  if (box) box.textContent = '正在嗅探 ' + ref + ' …';
+  try {
+    const data = await postJSON(API.templatesInspect, { ref: ref });
+    renderTemplateReport(data, ref);
+  } catch (err) {
+    if (box) {
+      box.textContent = '';
+      appendRepLine(box, '嗅探失败：' + err.message, 'err');
+    }
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = '嗅探节点';
+    }
+  }
+}
+
+// ── 批量队列 ──
+
+function clearBatchTimer() {
+  if (batchTimer) clearTimeout(batchTimer);
+  batchTimer = 0;
+}
+
+function batchUrls() {
+  const grid = $('batch_grid');
+  if (!grid) return [];
+  return Array.prototype.slice.call(grid.querySelectorAll('.batch-card'))
+    .map((c) => ({ url: c.dataset.url || '', seed: (c.querySelector('.batch-seed') || {}).textContent || '' }))
+    .filter((x) => !!x.url);
+}
+
+function jobStateOf(job, data) {
+  const s = String((job && job.state) || '');
+  if (s) return s;
+  return String((data && data.state) || 'queued');
+}
+
+function renderBatchGrid(data) {
+  const grid = $('batch_grid');
+  if (!grid) return;
+  const jobs = Array.isArray(data && data.jobs) ? data.jobs : [];
+  grid.textContent = '';
+  jobs.forEach((job, i) => {
+    const state = jobStateOf(job, data);
+    const pct = Math.round(clamp(num(job && job.progress, 0), 0, 1) * 100);
+
+    const card = document.createElement('figure');
+    card.className = 'batch-card ' + (state === 'done' ? 'is-done' : state === 'error' ? 'is-error' : 'is-run');
+
+    const cap = document.createElement('figcaption');
+    cap.className = 'batch-cap';
+    const label = document.createElement('span');
+    label.className = 'batch-label';
+    label.textContent = String((job && job.label) || '机位 ' + (i + 1));
+    const seedEl = document.createElement('span');
+    seedEl.className = 'batch-seed';
+    seedEl.textContent = 'seed ' + ((job && job.seed != null) ? job.seed : '—');
+    cap.appendChild(label);
+    cap.appendChild(seedEl);
+
+    const body = document.createElement('div');
+    body.className = 'batch-body';
+    const imgs = Array.isArray(job && job.images) ? job.images : [];
+    const tile = imgs.length ? normalizeTile(imgs[0], (job && job.seed)) : null;
+    if (tile && tile.url) {
+      const img = document.createElement('img');
+      img.loading = 'lazy';
+      img.alt = label.textContent;
+      img.src = tile.url;
+      body.appendChild(img);
+      card.dataset.url = tile.url;
+    } else {
+      const ph = document.createElement('div');
+      ph.className = 'batch-ph';
+      ph.textContent = state === 'error' ? '失败' : state === 'done' ? '完成但无图' : state === 'queued' ? '排队…' : pct + '%';
+      body.appendChild(ph);
+      if (state !== 'error') {
+        const bar = document.createElement('div');
+        bar.className = 'batch-bar';
+        const fill = document.createElement('span');
+        fill.style.width = pct + '%';
+        bar.appendChild(fill);
+        body.appendChild(bar);
+      }
+    }
+
+    const meta = document.createElement('div');
+    meta.className = 'batch-meta';
+    if (state === 'error') {
+      meta.textContent = '失败：' + String((job && job.error) || (data && data.error) || '未知错误');
+    } else if (state === 'done') {
+      meta.textContent = '完成';
+    } else if (state === 'queued') {
+      meta.textContent = '排队中';
+    } else {
+      meta.textContent = '生成中 ' + pct + '%';
+    }
+
+    card.appendChild(cap);
+    card.appendChild(body);
+    card.appendChild(meta);
+    grid.appendChild(card);
+  });
+
+  if (!jobs.length) {
+    const ph = document.createElement('div');
+    ph.className = 'batch-ph empty';
+    ph.textContent = '还没有批量任务：选一个序列后点「批量出图」。';
+    grid.appendChild(ph);
+  }
+}
+
+function setBatchBusy(busy) {
+  batchRunning = busy;
+  const btn = $('btn_batch_run');
+  if (!btn) return;
+  btn.disabled = busy;
+  btn.textContent = busy ? '批量中…' : '批量出图';
+}
+
+async function refreshGallery() {
+  try {
+    loadGallery(await api(API.gallery));
+  } catch (_) {
+    /* 画廊刷新失败静默：批量成品已经在 batch_grid 里 */
+  }
+}
+
+async function runBatch() {
+  if (batchRunning) return;
+  const sel = $('seq_select');
+  const name = sel ? sel.value : '';
+  if (!seqDefs[name]) await loadSequences();
+  const def = seqDefs[name];
+  const shots = def && Array.isArray(def.shots) ? def.shots : [];
+  if (!shots.length) {
+    setBatchStatus('没有可用序列：GET /api/sequences 没返回机位，先跑序列页', 'err');
+    return;
+  }
+
+  const nameEl = $('batch_name');
+  batchLabel = (nameEl && String(nameEl.value || '').trim()) || S.batch_name || '三视图';
+  const seedEl = $('batch_seed');
+  const seed = Math.trunc(num(seedEl ? seedEl.value : S.batch_seed, 12345));
+  const sameEl = $('batch_same_seed');
+  const sameSeed = sameEl ? !!sameEl.checked : S.batch_same_seed !== false;
+
+  clearBatchTimer();
+  setBatchBusy(true);
+  const grid = $('batch_grid');
+  if (grid) grid.textContent = '';
+  setBadge('batch', '0 / ' + shots.length);
+  setBatchStatus('正在提交「' + batchLabel + '」' + shots.length + ' 张…');
+
+  try {
+    const body = {
+      name: batchLabel,
+      base: Object.assign({}, cameraPayload(), genPayload()),
+      shots: shots.map((s) => {
+        const params = (s && s.params && typeof s.params === 'object') ? s.params : {};
+        return { label: String((s && s.label) || '机位'), params: params };
+      }),
+      same_seed: sameSeed,
+      seed: seed,
+    };
+    const data = await postJSON(API.batch, body);
+    batchId = String((data && (data.batch_id || data.id)) || '');
+    if (!batchId) throw new Error('后端未返回 batch_id');
+    const jobs = Array.isArray(data.jobs) ? data.jobs : [];
+    renderBatchGrid({ state: 'queued', done: 0, total: jobs.length, jobs: jobs });
+    setBadge('batch', '0 / ' + (jobs.length || shots.length));
+    setBatchStatus('批次 ' + batchId + ' 已提交 · 排队中');
+    batchTimer = setTimeout(pollBatch, 900);
+  } catch (err) {
+    setBatchBusy(false);
+    setBatchStatus('批量提交失败：' + err.message, 'err');
+  }
+}
+
+async function pollBatch() {
+  batchTimer = 0;
+  if (!batchId) return;
+  try {
+    const data = (await api(API.batchGet(batchId))) || {};
+    renderBatchGrid(data);
+    const state = String(data.state || '');
+    const done = Math.trunc(num(data.done, 0));
+    const total = Math.trunc(num(data.total, 0));
+    setBadge('batch', done + ' / ' + total);
+    if (state === 'done') {
+      setBatchBusy(false);
+      setBatchStatus('批次「' + (data.name || batchLabel) + '」完成 · ' + done + '/' + total, 'ok');
+      refreshGallery();
+      return;
+    }
+    if (state === 'error') {
+      setBatchBusy(false);
+      setBatchStatus('批次失败：' + (data.error || '后端没给原因'), 'err');
+      return;
+    }
+    setBatchStatus('批次 ' + batchId + ' · ' + (state === 'queued' ? '排队中' : '生成中') + ' ' + done + '/' + total);
+    batchTimer = setTimeout(pollBatch, 900);
+  } catch (err) {
+    setBatchBusy(false);
+    setBatchStatus('批次轮询失败：' + err.message, 'err');
+  }
+}
+
+// ── v2.3 绑定与回填 ──
+
+function syncWfTemplate() {
+  const wf = $('wf_template');
+  if (!wf) return;
+  const want = String(S.template || '');
+  if (!want) return;
+  const has = Array.prototype.some.call(wf.options, (o) => o.value === want);
+  if (has) {
+    wf.value = want;
+    S.workflow_template = want;
+  }
+}
+
+function applyV23UI() {
+  const auto = $('cn_auto_inject');
+  if (auto) auto.checked = !!S.cn_auto_inject;
+  const kindSel = $('cn_kind_select');
+  if (kindSel) kindSel.value = ['depth', 'pose', 'both'].indexOf(String(S.cn_kind)) >= 0 ? String(S.cn_kind) : 'depth';
+  const cnStr = $('cn_strength');
+  if (cnStr) cnStr.value = String(clamp(num(S.cn_strength, 1), 0, 2));
+  const cnOut = document.querySelector('[data-val="cn_strength"]');
+  if (cnOut) cnOut.textContent = clamp(num(S.cn_strength, 1), 0, 2).toFixed(2);
+
+  const bName = $('batch_name');
+  if (bName) bName.value = S.batch_name || '三视图';
+  const bSeed = $('batch_seed');
+  if (bSeed) bSeed.value = String(Math.trunc(num(S.batch_seed, 12345)));
+  const bSame = $('batch_same_seed');
+  if (bSame) bSame.checked = S.batch_same_seed !== false;
+
+  cnFiles.depth = S.cn_depth_file || '';
+  cnFiles.pose = S.cn_pose_file || '';
+  if (cnFiles.depth || cnFiles.pose) {
+    const parts = [];
+    if (cnFiles.depth) parts.push('深度 ' + cnFiles.depth);
+    if (cnFiles.pose) parts.push('骨架 ' + cnFiles.pose);
+    setBadge('cn', '已就绪');
+    setCnStatus('已记录的 ControlNet 文件：' + parts.join(' · ') + '（' + (S.cn_auto_inject ? '会自动注入' : '自动注入已关闭') + '）');
+  }
+  setBatchStatus('未开始 · 选序列后点「批量出图」');
+  renderBatchGrid({ state: 'queued', jobs: [] });
+}
+
+function bindV23() {
+  const depthBtn = $('btn_depth_export');
+  if (depthBtn) depthBtn.addEventListener('click', () => exportControlNet('depth'));
+
+  const poseBtn = $('btn_pose_export');
+  if (poseBtn) poseBtn.addEventListener('click', () => exportControlNet('pose'));
+
+  const auto = $('cn_auto_inject');
+  if (auto) {
+    auto.addEventListener('change', () => {
+      S.cn_auto_inject = !!auto.checked;
+      setCnStatus(auto.checked ? '已开启自动注入：导出的 filename 会进 template_vars。' : '已关闭自动注入：导出仍会上传，但生成不带 ControlNet。');
+      scheduleConfigSave();
+    });
+  }
+
+  const kindSel = $('cn_kind_select');
+  if (kindSel) {
+    kindSel.addEventListener('change', () => {
+      S.cn_kind = kindSel.value;
+      scheduleConfigSave();
+    });
+  }
+
+  const cnStr = $('cn_strength');
+  if (cnStr) {
+    cnStr.addEventListener('input', () => {
+      S.cn_strength = clamp(num(cnStr.value, 1), 0, 2);
+      const out = document.querySelector('[data-val="cn_strength"]');
+      if (out) out.textContent = S.cn_strength.toFixed(2);
+      scheduleConfigSave();
+    });
+  }
+
+  const tplSel = $('template_select');
+  if (tplSel) {
+    tplSel.addEventListener('change', () => {
+      S.template = tplSel.value;
+      syncWfTemplate();
+      setBadge('tpl', tplSel.value ? '已选模板' : '未选模板');
+      scheduleConfigSave();
+    });
+  }
+
+  const tplBtn = $('btn_template_inspect');
+  if (tplBtn) tplBtn.addEventListener('click', inspectTemplate);
+
+  const bName = $('batch_name');
+  if (bName) {
+    bName.addEventListener('input', () => {
+      S.batch_name = bName.value;
+      scheduleConfigSave();
+    });
+  }
+  const bSeed = $('batch_seed');
+  if (bSeed) {
+    bSeed.addEventListener('input', () => {
+      S.batch_seed = Math.trunc(num(bSeed.value, 12345));
+      scheduleConfigSave();
+    });
+  }
+  const bSame = $('batch_same_seed');
+  if (bSame) {
+    bSame.addEventListener('change', () => {
+      S.batch_same_seed = !!bSame.checked;
+      scheduleConfigSave();
+    });
+  }
+
+  const runBtn = $('btn_batch_run');
+  if (runBtn) runBtn.addEventListener('click', runBatch);
+
+  const grid = $('batch_grid');
+  if (grid) {
+    grid.addEventListener('click', (e) => {
+      const card = e.target.closest ? e.target.closest('.batch-card') : null;
+      if (!card || !card.dataset.url) return;
+      const list = batchUrls();
+      const idx = list.findIndex((x) => x.url === card.dataset.url);
+      openLightbox(idx < 0 ? 0 : idx, list);
+    });
+  }
+}
+
 // ─────────────────────────── 绑定 ───────────────────────────
 
 function bindCameraInputs() {
@@ -1609,6 +2239,9 @@ async function init() {
     }
   }
 
+  // v2.3：把实例挂到 window 上，ControlNet 导出与其它模块都从这里取
+  window.__rig = rig || null;
+
   // index.html 的 #roll 还是 min=0（不在本任务文件范围）：放宽到 -1，
   // 否则拖外环拖出来的负向荷兰角在滑块上拨不回来
   const rollEl = $('roll');
@@ -1620,6 +2253,7 @@ async function init() {
   bindButtons();
   bindLightbox();
   bindShortcutReset();
+  bindV23();
 
   const results = await Promise.allSettled([
     api(API.meta),
@@ -1642,6 +2276,7 @@ async function init() {
 
   writeCameraUI();
   syncGenUI();
+  applyV23UI();
   pushRig();
   if (rig) {
     rig.setRefOpacity(S.ref_opacity);
@@ -1684,6 +2319,7 @@ async function init() {
   }
 
   loadSequences();
+  loadTemplates();
 
   if (rig) rig.resize();
 

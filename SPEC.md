@@ -252,3 +252,62 @@ focal, fov_deg, lens, roll_deg, pole_gate, azimuth_suppressed, behind_ratio, fra
 subject_yaw（世界系）, rel_yaw（= wrap(subject_yaw - pos_x)）, pan[2], tokens{positive,negative,total,limit,warn,level}；
 parts[] 每项 {kind, key, raw, weight, phrase, tokens[], note}，kind in {az, el, di, lens, tg, frame, subject, gaze}。
 
+## 10. v2.3 工程化与 ControlNet 联动
+
+### 10.1 双端共享 3D 核心 `js/camera_rig.js`
+
+Studio 的 `studio/web/camera3d.js` 与 ComfyUI 节点卡片里的 `js/sdxl_camera_widget.js` 曾经各维护一套 THREE 场景，
+任何几何改动都得改两遍。v2.3 起场景只剩一份：`CameraRig`。
+
+```js
+const rig = new CameraRig(canvas, { compact: false, interactive: true,
+                                    onChange: s => {}, onCommit: s => {} });
+```
+
+| 方法 | 作用 |
+|---|---|
+| `setState(dict)` / `getState()` | 与 compute_camera 同名的 8+ 个参数（pos_x/pos_y/pos_z/roll/focal/pan_x/pan_y/subject_yaw/gaze_mode） |
+| `applyShot(n)` | 1..6 标准机位（正/背/左正侧/右正侧/高/低） |
+| `toggleGrid(bool)` / `toggleFrustum(bool)` | 三分法九宫格 / 动态视锥线框 |
+| `setRefImage(url)` / `setRefOpacity(v)` | 参考图叠层 |
+| `resize()` / `dispose()` | 尺寸同步 / 释放 geometry、material、renderer |
+| `renderDepthDataURL(w, h, {invert})` | 离屏深度图（`MeshDepthMaterial` + `BasicDepthPacking`；该 packing 原生是**近 0 黑 / 远 1 白**，`invert:true`（默认）在 2D 画布上取反后才是**白=近、黑=远**；背景填远端 `0xffffff`，不会被当成贴脸点） |
+| `renderPoseDataURL(w, h)` | 离屏 OpenPose 18 点骨架（黑底、右红左蓝中黄） |
+
+`compact: true` 时只用 canvas 自身尺寸（缺省 320×300）、不挂 document 级键盘监听、不读任何 DOM id，
+因此可以直接塞进 ComfyUI 节点卡片；Studio 侧把快捷键与滑块绑定留在 `camera3d.js` 薄壳里。
+渲染仍是按需的：状态变化 `invalidate()` 才画一帧，静止时 0 帧，离屏导出不会改动当前 viewport。
+
+### 10.2 ControlNet 深度 / 骨架注入
+
+3D 视口本身就是「这张图应该长什么样」的几何真值，所以可以直接拿它当 ControlNet 的控制图：
+
+1. 前端 `renderDepthDataURL(512, 768)` → `data:image/png;base64,…`；
+2. `POST /api/controlnet/upload {kind, data_url}` → 后端解码后经 ComfyUI `POST /upload/image` 上传到 `input/`；
+3. 生成时把返回的 `filename` 放进 `template_vars.controlnet_depth`（或 `controlnet_pose`）；
+4. `template_bridge.build` 找到模板里的 `ControlNetApplyAdvanced.image` 输入，改写成该 filename（若是链接则插入 `LoadImage` 再改链，不动其它结构）。
+
+深度图口径：**近=白、远=黑**（`MeshDepthMaterial` + `BasicDepthPacking` 原生是近 0 黑 / 远 1 白，导出时在 2D 画布上取反；背景填远端 `0xffffff`，否则空景会被标成贴脸最近点），与 `control_v11f1p_sd15_depth` / `controlnet-union-sdxl` 的输入一致；
+导出相机按主体包围盒**自动贴框**（`_cameraFor(aspect, fit=true)`：主体盒 8 角投到相机屏幕轴取 `halfW/halfH`，`dist = max(halfH/tan(vHalf), halfW/tan(hHalf)) / EXPORT_FIT_MARGIN(0.92)`，两轴取大值所以横幅也不裁切），depth 与 pose 复用同一台 cam 实例，轮廓天然对齐；
+本机可用的控制模型是 `controlnet-union-sdxl-1.0.safetensors`（union 同时覆盖 depth 与 openpose），示例模板见 `workflows/SDXL.CameraAngle.ControlNet.json`：
+该模板有**两个** `ControlNetApplyAdvanced` 槽位——节点 10 吃 depth（`strength 0.65` / `end_percent 0.85`），节点 13 吃 pose（`strength 0.45` / `end_percent 0.6`，串在 10 的下游），sniff 按节点 id 顺序分配 `controlnet_depth` → 10、`controlnet_pose` → 13；只给一个变量时另一个槽位保持作者填的占位图。
+骨架图口径：18 点（0 鼻 1 颈 2 右肩 3 右肘 4 右腕 5 左肩 6 左肘 7 左腕 8 右髋 9 右膝 10 右踝 11 左髋 12 左膝 13 左踝 14 右眼 15 左眼 16 右耳 17 左耳），
+配色沿用 OpenPose 官方（右 `#ff0000`、左 `#0000ff`、中 `#ffff00`），ControlNet openpose 直接可吃。
+
+### 10.3 任意工作流嗅探与多机位批量
+
+`template_bridge.inspect(ref)` 只读地报出「这条工作流会被注入哪几个节点」：
+
+| 槽位 | 嗅探规则 |
+|---|---|
+| `camera` | 存在 `CameraAngleSDXL` 节点时优先，直接写它的 positive/negative 输出后的 CLIPTextEncode |
+| `positive` / `negative` | `vars.prompt` 绑定节点；否则从 `KSampler.positive/negative` 连线回溯 `CLIPTextEncode*` |
+| `sampler` / `latent` / `save` | 按 class_type 找 `KSampler*` / `Empty*LatentImage` / `SaveImage` |
+| `controlnet.depth` / `.pose` | `ControlNetApplyAdvanced.image` 的上游（`LoadImage` 或直接值） |
+
+注入永远是「只改 inputs」：不新增/删除节点（除非 ControlNet 槽位是链接，需要补一个 `LoadImage`），不改 class_type，不覆盖作者写的负向原文（`negative_mode="replace"` 才覆盖）。
+无法识别 UI 格式工程文件时返回明确错误，而不是猜。
+
+批量队列 `POST /api/batch` 用同一份 base 参数与同一 seed 依次提交多个机位（三视图 / 环绕 8 机位 / 推拉 / 俯仰），
+`GET /api/batch?batch_id=` 聚合每张的 state/progress/images，Studio 用网格并排对比；ComfyUI 离线时整单 503，不会半提交。
+

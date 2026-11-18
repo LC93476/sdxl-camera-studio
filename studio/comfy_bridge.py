@@ -19,6 +19,7 @@ GET /object_info/*、POST /interrupt。
 
 import http.client
 import json
+import os
 import socket
 import urllib.parse
 
@@ -36,6 +37,10 @@ FALLBACK_SCHEDULERS = ["normal", "karras", "exponential", "sgm_uniform", "simple
 
 class ComfyError(Exception):
     """ComfyUI 通讯/协议错误（离线、超时、4xx/5xx、非 JSON）。"""
+
+
+# 兼容别名：外部文档里也叫 ComfyBridgeError，指向同一个类
+ComfyBridgeError = ComfyError
 
 
 # ══════════════════════ 连接（分离的连接/读取超时） ══════════════════════
@@ -92,24 +97,30 @@ class ComfyBridge(object):
 
     # ---------- 原始请求 ----------
     def _request(self, path, payload=None, method=None):
-        """返回 response body bytes；任何失败抛 ComfyError。"""
+        """JSON 收发：返回 response body bytes；任何失败抛 ComfyError。"""
+        body = None
+        headers = {}
+        if payload is not None:
+            body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            headers["Content-Type"] = "application/json"
+            if method is None:
+                method = "POST"
+        return self._raw(path, body, headers, method)
+
+    def _raw(self, path, body=None, headers=None, method=None):
+        """原样发字节（multipart 上传走这里）：返回 body bytes；失败抛 ComfyError。"""
         conn_cls = _HTTPSConn if self.scheme == "https" else _HTTPConn
         conn = None
         try:
             conn = conn_cls(self.host, self.port)
-            headers = {
+            hdrs = {
                 "Accept": "application/json",
                 "User-Agent": "sdxl-camera-studio/1.0",
             }
-            body = None
-            if payload is not None:
-                body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-                headers["Content-Type"] = "application/json"
-                if method is None:
-                    method = "POST"
+            hdrs.update(headers or {})
             if method is None:
-                method = "GET"
-            conn.request(method, self.prefix + path, body=body, headers=headers)
+                method = "POST" if body is not None else "GET"
+            conn.request(method, self.prefix + path, body=body, headers=hdrs)
             resp = conn.getresponse()
             data = resp.read()
             if resp.status >= 400:
@@ -365,6 +376,51 @@ class ComfyBridge(object):
             "type": image_type or "output",
         })
         return self._request("/view?" + query)
+
+    # ---------- 上传（ControlNet 控制图进 ComfyUI 的 input/） ----------
+    def upload_image(self, blob, filename="image.png", subfolder="", image_type="input"):
+        """POST /upload/image（multipart/form-data，手工拼，纯标准库）。
+
+        返回 {"name": 实际文件名, "subfolder": ..., "type": ...}；
+        离线 / 被拒抛 ComfyError（上层转 503）。
+        """
+        blob = blob if isinstance(blob, (bytes, bytearray)) else b""
+        raw_name = str(filename or "image.png").replace("\\", "/")
+        name = os.path.basename(raw_name) or "image.png"
+        boundary = "----CameraStudio" + os.urandom(10).hex()
+        chunks = []
+        form = [("type", image_type or "input")]
+        if subfolder:
+            form.append(("subfolder", subfolder))
+        for key, value in form:
+            chunks.append(("--%s\r\n" % boundary).encode("utf-8"))
+            chunks.append(('Content-Disposition: form-data; name="%s"\r\n\r\n' % key).encode("utf-8"))
+            chunks.append(str(value).encode("utf-8"))
+            chunks.append(b"\r\n")
+        chunks.append(("--%s\r\n" % boundary).encode("utf-8"))
+        chunks.append(
+            ('Content-Disposition: form-data; name="image"; filename="%s"\r\n' % name).encode("utf-8")
+        )
+        chunks.append(b"Content-Type: application/octet-stream\r\n\r\n")
+        chunks.append(bytes(blob))
+        chunks.append(b"\r\n")
+        chunks.append(("--%s--\r\n" % boundary).encode("utf-8"))
+        body = b"".join(chunks)
+        raw = self._raw("/upload/image", body, {
+            "Content-Type": "multipart/form-data; boundary=%s" % boundary,
+            "Content-Length": str(len(body)),
+        })
+        try:
+            data = json.loads(raw.decode("utf-8", "replace")) if raw else {}
+        except ValueError:
+            raise ComfyError("ComfyUI /upload/image 返回了非 JSON")
+        if not isinstance(data, dict):
+            raise ComfyError("ComfyUI /upload/image 返回格式异常")
+        return {
+            "name": str(data.get("name") or name),
+            "subfolder": str(data.get("subfolder") or ""),
+            "type": str(data.get("type") or image_type or "input"),
+        }
 
     def interrupt(self):
         self._request("/interrupt", {})

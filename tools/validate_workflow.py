@@ -38,6 +38,55 @@ def local_specs():
     return out
 
 
+def _is_api(wf):
+    """API 格式（工作流 → 导出 API）：顶层是 {节点id: {class_type, inputs}}，没有 nodes/links 数组。"""
+    if not isinstance(wf, dict) or "nodes" in wf:
+        return False
+    vals = [v for k, v in wf.items() if not str(k).startswith("_")]
+    return bool(vals) and all(isinstance(v, dict) and "class_type" in v for v in vals)
+
+
+def validate_api(wf, oi):
+    """API 格式没有 widgets_values，改校验：类型已知 / 必填输入齐 / 连线目标存在且槽位不越界。"""
+    nodes = {k: v for k, v in wf.items() if not str(k).startswith("_")}
+    bad = []
+    links = 0
+    for nid, n in nodes.items():
+        t = n.get("class_type")
+        if not t:
+            bad.append("node %s: 缺 class_type" % nid)
+            continue
+        inputs = n.get("inputs") or {}
+        if t in oi:
+            spec = oi[t]["input"]
+            req = [k for k in (spec.get("required") or {})]
+            miss = [k for k in req if k not in inputs]
+            if miss:
+                bad.append("node %s (%s): 缺必填输入 %s" % (nid, t, ", ".join(miss)))
+        for key, val in inputs.items():
+            if not (isinstance(val, list) and len(val) == 2 and isinstance(val[0], str)):
+                continue
+            src, slot = val[0], val[1]
+            links += 1
+            if src not in nodes:
+                bad.append("node %s.%s: 连线指向不存在的节点 %s" % (nid, key, src))
+                continue
+            st = nodes[src].get("class_type")
+            if st in oi:
+                outs = oi[st].get("output") or []
+                if not isinstance(slot, int) or slot >= len(outs):
+                    bad.append("node %s.%s: 源 %s(%s) 槽位 %s 越界（它有 %d 个输出）"
+                               % (nid, key, src, st, slot, len(outs)))
+    print("API 格式 / 节点 %d 个 / 连线 %d 条" % (len(nodes), links))
+    if bad:
+        print("问题 %d 条：" % len(bad))
+        for b in bad:
+            print("  -", b)
+        return 1
+    print("OK 全部通过")
+    return 0
+
+
 def main(path):
     wf = json.load(open(path, encoding="utf-8"))
     local = local_specs()
@@ -47,6 +96,8 @@ def main(path):
         print("warn: 服务器 /object_info 取不到（%s），只用本地节点定义" % e)
         oi = {}
     oi.update(local)   # 源码优先
+    if _is_api(wf):
+        return validate_api(wf, oi)
     nodes = {n["id"]: n for n in wf["nodes"]}
     links = {l[0]: l for l in wf["links"]}
     bad = []
@@ -105,4 +156,15 @@ def main(path):
 
 
 if __name__ == "__main__":
-    sys.exit(main(sys.argv[1] if len(sys.argv) > 1 else r"D:/QUARK/SDXL.CameraAngle.json"))
+    args = sys.argv[1:]
+    if not args:
+        wfdir = os.path.join(ROOT, "workflows")
+        args = sorted(os.path.join(wfdir, fn) for fn in os.listdir(wfdir) if fn.endswith(".json")) if os.path.isdir(wfdir) else []
+        if not args:
+            args = [os.path.join(ROOT, "workflows", "SDXL.CameraAngle.json")]
+    rc = 0
+    for p in args:
+        if len(args) > 1:
+            print("=== %s" % os.path.basename(p))
+        rc |= main(p)
+    sys.exit(rc)

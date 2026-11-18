@@ -223,6 +223,53 @@
 
       <div class="card">
         <div class="card-head">
+          <h2>ControlNet 参考图</h2>
+          <span class="badge soft" data-badge="cn">未导出</span>
+        </div>
+        <div class="cn-grid">
+          <figure class="cn-item">
+            <div class="cn-shot">
+              <img id="depth_preview" class="cn-preview" alt="深度图预览" hidden />
+              <span class="cn-empty">深度 depth</span>
+            </div>
+            <figcaption>
+              <button id="btn_depth_export" class="btn mini" type="button" title="从 3D 场景离屏渲染 512×768 深度图并上传 ComfyUI">导出深度</button>
+            </figcaption>
+          </figure>
+          <figure class="cn-item">
+            <div class="cn-shot">
+              <img id="pose_preview" class="cn-preview" alt="骨架图预览" hidden />
+              <span class="cn-empty">骨架 pose</span>
+            </div>
+            <figcaption>
+              <button id="btn_pose_export" class="btn mini" type="button" title="从 3D 场景投影 18 点 OpenPose 骨架并上传 ComfyUI">导出骨架</button>
+            </figcaption>
+          </figure>
+        </div>
+        <div class="field-grid three">
+          <label class="field chk">
+            <span>自动注入</span>
+            <input type="checkbox" id="cn_auto_inject" checked />
+          </label>
+          <label class="field">
+            <span>注入类型</span>
+            <select id="cn_kind_select">
+              <option value="depth">深度</option>
+              <option value="pose">骨架</option>
+              <option value="both">两者</option>
+            </select>
+          </label>
+          <label class="field">
+            <span>ControlNet 强度</span>
+            <input type="range" id="cn_strength" min="0" max="2" step="0.01" value="1" />
+            <span class="val" data-val="cn_strength">1.00</span>
+          </label>
+        </div>
+        <div id="cn_status" class="hint cn-status">导出的 filename 会记进下次生成的 template_vars。</div>
+      </div>
+
+      <div class="card">
+        <div class="card-head">
           <h2>生成设置</h2>
           <span class="badge soft" data-badge="models">未连接 ComfyUI</span>
         </div>
@@ -275,6 +322,21 @@
         </div>
       </div>
 
+      <div class="card">
+        <div class="card-head">
+          <h2>工作流嗅探</h2>
+          <span class="badge soft" data-badge="tpl">未选模板</span>
+        </div>
+        <div class="seq-controls">
+          <label class="field-inline grow">
+            <span>模板</span>
+            <select id="template_select"></select>
+          </label>
+          <button id="btn_template_inspect" class="btn mini primary" type="button" title="查看这条工作流会被注入哪几个节点">嗅探节点</button>
+        </div>
+        <div id="template_report" class="tpl-report">选一条工作流后点「嗅探节点」，这里显示会被注入的正向/负向/采样/保存节点与 ControlNet 槽位。</div>
+      </div>
+
       <div class="card gen">
         <div class="gen-row">
           <button id="btn_generate" class="btn primary">生成图片</button>
@@ -307,6 +369,32 @@
           <div class="seq-desc" id="seq_desc"></div>
           <div id="seq_strip" class="seq-strip"></div>
         </div>
+      </div>
+
+      <div class="card">
+        <div class="card-head">
+          <h2>批量队列</h2>
+          <div class="head-actions">
+            <span class="badge soft" data-badge="batch">0 / 0</span>
+            <button id="btn_batch_run" class="btn mini primary" type="button" title="按当前序列逐张提交，网格并排看进度与成品">批量出图</button>
+          </div>
+        </div>
+        <div class="field-grid three">
+          <label class="field">
+            <span>批次名</span>
+            <input type="text" id="batch_name" value="三视图" />
+          </label>
+          <label class="field">
+            <span>seed</span>
+            <input type="number" id="batch_seed" step="1" value="12345" />
+          </label>
+          <label class="field chk">
+            <span>same seed</span>
+            <input type="checkbox" id="batch_same_seed" checked />
+          </label>
+        </div>
+        <div id="batch_status" class="status sub">未开始 · 选序列后点「批量出图」</div>
+        <div id="batch_grid" class="batch-grid"></div>
       </div>
 
       <div class="card">

@@ -1,0 +1,9 @@
+# SDXL Camera Angle —— 零第三方依赖
+#
+# core/（camera_core.py、presets.py）与 nodes/（camera_sdxl_node.py）
+# 只 import Python 标准库：math / re / json / os / sys / itertools / dataclasses 等。
+# torch 由 ComfyUI 运行时提供（节点里 import torch），本仓库不声明、不锁定版本。
+# studio/ 桌面工作台同样只用标准库起 HTTP 服务，前端 three.js 已 vendored 在 js/ 里。
+#
+# 所以这里故意为空：pip install -r requirements.txt 只会升级 pip 自身，不会装包。
+# 新增依赖前请先确认 core/nodes 能在“干净解释器 + ComfyUI 自带 torch”下跑通。

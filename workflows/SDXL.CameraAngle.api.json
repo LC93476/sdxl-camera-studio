@@ -1,0 +1,158 @@
+{
+  "1": {
+    "_meta": {
+      "title": "主模型"
+    },
+    "class_type": "CheckpointLoaderSimple",
+    "inputs": {
+      "ckpt_name": "WAI-Nsfw-Illustrious-17.safetensors"
+    }
+  },
+  "2": {
+    "_meta": {
+      "title": "风格 LoRA"
+    },
+    "class_type": "LoraLoader",
+    "inputs": {
+      "model": [
+        "1",
+        0
+      ],
+      "clip": [
+        "1",
+        1
+      ],
+      "lora_name": "feiyue_xianxinglu_v2.safetensors",
+      "strength_model": 0.8,
+      "strength_clip": 0.8
+    }
+  },
+  "3": {
+    "_meta": {
+      "title": "相机机位"
+    },
+    "class_type": "CameraAngleSDXL",
+    "inputs": {
+      "pos_x": 0,
+      "pos_y": 0,
+      "pos_z": 0,
+      "roll": 0,
+      "focal": 50,
+      "pan_x": 0,
+      "pan_y": 0,
+      "subject_yaw": 0,
+      "gaze_mode": "auto",
+      "preset": "自定义",
+      "strength": 1,
+      "weight_mode": "tanh",
+      "azimuth_mode": "8bin",
+      "elevation_mode": "3bin",
+      "neg_strength": 1,
+      "extra_positive": "",
+      "extra_negative": "",
+      "_cfg_json": "{}"
+    }
+  },
+  "4": {
+    "_meta": {
+      "title": "正向编码"
+    },
+    "class_type": "CLIPTextEncode",
+    "inputs": {
+      "clip": [
+        "2",
+        1
+      ],
+      "text": [
+        "3",
+        0
+      ]
+    }
+  },
+  "5": {
+    "_meta": {
+      "title": "负向编码"
+    },
+    "class_type": "CLIPTextEncode",
+    "inputs": {
+      "clip": [
+        "2",
+        1
+      ],
+      "text": [
+        "3",
+        1
+      ]
+    }
+  },
+  "6": {
+    "_meta": {
+      "title": "画布"
+    },
+    "class_type": "EmptyLatentImage",
+    "inputs": {
+      "width": 832,
+      "height": 1216,
+      "batch_size": 1
+    }
+  },
+  "7": {
+    "_meta": {
+      "title": "采样器"
+    },
+    "class_type": "KSampler",
+    "inputs": {
+      "model": [
+        "2",
+        0
+      ],
+      "positive": [
+        "4",
+        0
+      ],
+      "negative": [
+        "5",
+        0
+      ],
+      "latent_image": [
+        "6",
+        0
+      ],
+      "seed": 20261180,
+      "steps": 26,
+      "cfg": 5,
+      "sampler_name": "euler_ancestral",
+      "scheduler": "karras",
+      "denoise": 1
+    }
+  },
+  "8": {
+    "_meta": {
+      "title": "解码"
+    },
+    "class_type": "VAEDecode",
+    "inputs": {
+      "samples": [
+        "7",
+        0
+      ],
+      "vae": [
+        "1",
+        2
+      ]
+    }
+  },
+  "9": {
+    "_meta": {
+      "title": "存图"
+    },
+    "class_type": "SaveImage",
+    "inputs": {
+      "images": [
+        "8",
+        0
+      ],
+      "filename_prefix": "camera/api"
+    }
+  }
+}

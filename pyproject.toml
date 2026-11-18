@@ -1,0 +1,43 @@
+# ComfyUI Registry 打包清单（node registry）
+# 发布：comfy node publish  （需要 COMFY_REGISTRY 的 API key）
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sdxl-camera-angle"
+version = "2.3.0"
+description = "SDXL 相机控制：pos_x/pos_y/pos_z/roll/focal 转提示词权重，ComfyUI 节点 + 本地 3D 相机工作台"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [{ name = "LC93476" }]
+keywords = ["comfyui", "sdxl", "camera", "camera-angle", "prompt", "controlnet", "three.js"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Multimedia :: Graphics",
+]
+# 零第三方依赖：core/ 与 nodes/ 只用标准库（torch 由 ComfyUI 自己提供，不在这里声明）
+dependencies = []
+
+[project.urls]
+Repository = "https://github.com/LC93476/sdxl-camera-studio"
+Documentation = "https://github.com/LC93476/sdxl-camera-studio/blob/main/README.md"
+
+# ── ComfyUI Registry 必须字段 ──
+[tool.comfy]
+PublisherId = "lc93476"
+DisplayName = "SDXL Camera Angle"
+Icon = "studio/icon.png"
+
+# 只打包节点本体（core + nodes）；studio/ 是本机工作台，不进 zip
+[tool.setuptools]
+packages = ["core", "nodes"]
+include-package-data = false
+
+[tool.setuptools.package-data]
+core = ["*.py"]
+nodes = ["*.py"]

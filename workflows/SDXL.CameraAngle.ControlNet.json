@@ -1,0 +1,207 @@
+{
+  "1": {
+    "_meta": {
+      "title": "主模型"
+    },
+    "class_type": "CheckpointLoaderSimple",
+    "inputs": {
+      "ckpt_name": "WAI-Nsfw-Illustrious-17.safetensors"
+    }
+  },
+  "2": {
+    "_meta": {
+      "title": "风格 LoRA"
+    },
+    "class_type": "LoraLoader",
+    "inputs": {
+      "model": [
+        "1",
+        0
+      ],
+      "clip": [
+        "1",
+        1
+      ],
+      "lora_name": "feiyue_xianxinglu_v2.safetensors",
+      "strength_model": 0.8,
+      "strength_clip": 0.8
+    }
+  },
+  "3": {
+    "_meta": {
+      "title": "正向提示词"
+    },
+    "class_type": "CLIPTextEncode",
+    "inputs": {
+      "clip": [
+        "2",
+        1
+      ],
+      "text": "masterpiece, best quality, 1girl"
+    }
+  },
+  "4": {
+    "_meta": {
+      "title": "负向提示词"
+    },
+    "class_type": "CLIPTextEncode",
+    "inputs": {
+      "clip": [
+        "2",
+        1
+      ],
+      "text": "lowres, worst quality, bad anatomy"
+    }
+  },
+  "5": {
+    "_meta": {
+      "title": "画布"
+    },
+    "class_type": "EmptyLatentImage",
+    "inputs": {
+      "width": 832,
+      "height": 1216,
+      "batch_size": 1
+    }
+  },
+  "6": {
+    "_meta": {
+      "title": "采样器"
+    },
+    "class_type": "KSampler",
+    "inputs": {
+      "model": [
+        "2",
+        0
+      ],
+      "positive": [
+        "13",
+        0
+      ],
+      "negative": [
+        "13",
+        1
+      ],
+      "latent_image": [
+        "5",
+        0
+      ],
+      "seed": 20261180,
+      "steps": 26,
+      "cfg": 5,
+      "sampler_name": "euler_ancestral",
+      "scheduler": "karras",
+      "denoise": 1
+    }
+  },
+  "7": {
+    "_meta": {
+      "title": "解码"
+    },
+    "class_type": "VAEDecode",
+    "inputs": {
+      "samples": [
+        "6",
+        0
+      ],
+      "vae": [
+        "1",
+        2
+      ]
+    }
+  },
+  "8": {
+    "_meta": {
+      "title": "存图"
+    },
+    "class_type": "SaveImage",
+    "inputs": {
+      "images": [
+        "7",
+        0
+      ],
+      "filename_prefix": "camera/controlnet"
+    }
+  },
+  "9": {
+    "_meta": {
+      "title": "控制图输入"
+    },
+    "class_type": "LoadImage",
+    "inputs": {
+      "image": "cn_depth_placeholder.png"
+    }
+  },
+  "10": {
+    "_meta": {
+      "title": "ControlNet 应用"
+    },
+    "class_type": "ControlNetApplyAdvanced",
+    "inputs": {
+      "positive": [
+        "3",
+        0
+      ],
+      "negative": [
+        "4",
+        0
+      ],
+      "control_net": [
+        "11",
+        0
+      ],
+      "image": [
+        "9",
+        0
+      ],
+      "strength": 0.65,
+      "start_percent": 0,
+      "end_percent": 0.85
+    }
+  },
+  "11": {
+    "_meta": {
+      "title": "ControlNet 模型"
+    },
+    "class_type": "ControlNetLoader",
+    "inputs": {
+      "control_net_name": "controlnet-union-sdxl-1.0.safetensors"
+    }
+  },
+  "12": {
+    "_meta": {
+      "title": "骨架图输入"
+    },
+    "class_type": "LoadImage",
+    "inputs": {
+      "image": "cn_pose_placeholder.png"
+    }
+  },
+  "13": {
+    "_meta": {
+      "title": "ControlNet 应用（骨架）"
+    },
+    "class_type": "ControlNetApplyAdvanced",
+    "inputs": {
+      "positive": [
+        "10",
+        0
+      ],
+      "negative": [
+        "10",
+        1
+      ],
+      "control_net": [
+        "11",
+        0
+      ],
+      "image": [
+        "12",
+        0
+      ],
+      "strength": 0.45,
+      "start_percent": 0,
+      "end_percent": 0.6
+    }
+  }
+}

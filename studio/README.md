@@ -57,7 +57,7 @@ D:\QUARK\ComfyUI-aki-v3.2\python\python.exe D:\QUARK\sdxl_camera_angle\studio\se
    「未连接 ComfyUI」，checkpoint 下拉只有一项「未连接 ComfyUI」，点「生成图片」得到 503 `{"error":"ComfyUI 未启动"}`。
 2. **Python 用 ComfyUI 自带的那只**：`D:\QUARK\ComfyUI-aki-v3.2\python\python.exe`（3.13，带 PIL）。
    `launch.py` 先按相对路径猜 `ComfyUI-aki-v3.2/python/python.exe`，再退回 `sys.executable`。
-3. 后端只用标准库，前端只用原生 ES module + 本地 three.js（`web/vendor/three.module.js`），
+3. 后端只用标准库，前端只用原生 ES module + 本地 three.js（经 `/js/three.module.js` 复用仓库根那一份，`web/vendor/` 已删除），
    **完全离线可用**，不装任何 pip 包，也不走 CDN。
 
 ## 3. 界面说明
@@ -277,6 +277,51 @@ roll 在已被自身旋转的坐标系里量角，导致拖 30 度只出 15 度�
 
 > token 预算：相机正向段 >65 标黄、>75 标红（CLIP Chunk 0 上限 75）。工作台 `42 / 75 tok`、节点视口 `44 / 75 tok` 同一口径。
 
+### 5d. ControlNet 深度 / 骨架联动（v2.3）
+
+3D 视口里的那个机位可以直接变成 ControlNet 的**构图约束**：`js/camera_rig.js` 的 `CameraRig` 提供两个离屏导出，
+镜头与视口完全一致（同一套 fov / position / quaternion / roll）：
+
+| 方法 | 口径 | 说明 |
+|---|---|---|
+| `renderDepthDataURL(w,h,{invert:true})` | **白近黑远**，背景填远端 | 给 `controlnet-union-sdxl` 的 depth 分支 |
+| `renderPoseDataURL(w,h)` | 黑底 + 18 点骨架（右红 / 左蓝 / 中轴黄） | 给 union 的 pose / openpose 分支 |
+
+界面流程（右侧「ControlNet」卡）：
+
+1. 先调好机位（拖 3D 或滑块都行）；
+2. 点「导出深度」/「导出骨架」→ 预览图立刻出现在卡里；
+3. 同时自动 `POST /api/controlnet/upload`，后端把 PNG 交给 ComfyUI 的 `/upload/image`（落 `input/`），
+   并在本地留一份 `state/controlnet/cn_<kind>_<sha1前8>.png`；状态行显示文件名与字节数；
+4. 勾「自动注入」（默认开）→ 提交时按 `cn_kind`（depth / pose / both）写进 `template_vars.controlnet_depth`、
+   `template_vars.controlnet_pose`，强度取滑块 `controlnet_strength`（0–2，默认 0.65）。
+
+模板侧怎么接：`template_bridge.py` 会自己找 `ControlNetApplyAdvanced`（或 `ControlNetApply`）的 `image` 输入；
+模板里已有 `LoadImage` 就**只换图**，没有就在链上插一个 `LoadImage` 并改连线。仓库里的
+`workflows/SDXL.CameraAngle.ControlNet.json` 已经是**双槽**示例：节点 10 = depth（0.65 / end 0.85），
+节点 13 = pose（0.45 / end 0.6，串在 depth 下游），`controlnet_depth` 与 `controlnet_pose` 会分别落到这两个槽位；
+只传一个变量时另一个槽位保持模板自带的占位图。
+模板里没有 ControlNet 槽位时不报错，只在 `warn` 里说一句「模板里没有 ControlNet 槽位」。
+
+> 真实链路实测（同一套 512×768 导出，三张都留在本地 `demo_v23/`）：
+> 1. `CameraRig.renderDepthDataURL(512,768)` → 27,718 B（白=近、四角纯黑、人物占 81% 画幅）→ `/api/controlnet/upload`
+>    → `/api/generate`（depth 0.65）→ 200，`warn` 为空，出图落 `studio/out`；
+> 2. 同一个 harness 里 `renderPoseDataURL(512,768)` → 26,110 B 骨架，与 depth **同 cam 实例**、外接框中心偏差 0 px；
+> 3. 双槽一起发（depth 0.6 + pose 0.45）→ 200，`sniff` 报 `controlnet.depth=[10] / pose=[13]`、`warn` 为空，
+>    出图轮廓与骨架严格贴合（侧身 3/4、镜头方位词同时生效）。
+
+### 5e. 多机位批量队列（v2.3）
+
+「批量队列」卡把一条序列（三视图 4 张 / 环绕 8 机位 / 推拉 6 张 / 俯仰 5 张）一次性排队，同 seed 出图后并排对比：
+
+- 序列：来自 `core/presets.py` 的 `SEQUENCES`（与 `/api/sequences` 同源）；
+- seed：填 `-1` 走随机；勾「同 seed」时所有机位共用一个种子，这是**唯一**能公平比较视角的跑法；
+- 提交走 `POST /api/batch`（上限 `MAX_BATCH_SHOTS=24`），返回 `batch_id` + `jobs[]`，前端 900ms 轮询 `GET /api/batch?batch_id=…`；
+- 出图在 `#batch_grid` 里并排（带 seed 角标、进度条、失败原因原文），点任意一张开大图，全部完成后画廊自动刷新；
+- 记录落 `state/batches.json`（原子写，保留最近 50 条），服务重启后还能查。
+
+ComfyUI 离线时整单 `503` + `jobs: []`（不半途而废，也不会留下幽灵任务）。
+
 ## 6. HTTP API
 
 全部 JSON、UTF-8，根地址 `http://127.0.0.1:{PORT}`；错误统一 4xx/5xx + `{"error": "..."}`。
@@ -285,12 +330,16 @@ roll 在已被自身旋转的坐标系里量角，导致拖 30 度只出 15 度�
 | # | 方法 | 路径 | 参数 | 返回要点 |
 |---|---|---|---|---|
 | 1 | GET | `/api/health` | — | `{ok, version, comfy_url, comfy_reachable, port, out_dir, web_dir}` |
-| 2 | GET | `/api/meta` | — | `{version, presets, preset_names, preset_modes, ui_presets, defaults, enums, vocab, templates}`；`presets` 是 11 个内置，`ui_presets` 是用户存的，`templates` 同 `/api/templates` |
+| 2 | GET | `/api/meta` | — | `{version, presets, preset_names, preset_modes, ui_presets, defaults, enums, vocab, focals, gaze_modes, sequences, templates}`；`presets` 是 16 个内置，`ui_presets` 是用户存的 17 键 dict，`templates` 同 `/api/templates` |
 | 3 | POST | `/api/preview` | 12 个相机参数 + `manual_positive` / `manual_negative` | `{positive, negative, camera_info, parts, tokens:{positive,negative}, warn:[str], params}`；`camera_info` 是对象不是字符串 |
 | 4 | POST | `/api/generate` | 相机参数 + `seed, randomize, steps, cfg, width, height, sampler, scheduler, checkpoint, lora_name, lora_strength, batch, save_prefix`；模板模式另加 `workflow_template, pose_id, template_vars, negative_mode` | `{prompt_id, template, warn:[str], seed_used, seed_source, steps, cfg, width, height, sampler, scheduler, checkpoint, lora_name, batch, positive, negative}` |
 | 5 | GET | `/api/progress?prompt_id=…` | `prompt_id` 必填 | `{state, progress, node, queue_pos, images:[{filename,subfolder,type,url,local?,seed?,error?}], error, elapsed}`；离线时另有 `warn` |
 | 6 | GET | `/api/view?local=…` | `local`（相对 out 的路径）**或** `filename` + `subfolder` + `type` | 图像字节；路径穿越 → 403，不存在 → 404 |
 | 6b | GET | `/api/templates` | — | `{templates:[{id, name, path, dir, title, description, vars, valid, error, nodes}], dirs:[str]}`（**不会因 ComfyUI 离线 5xx**） |
+| 6c | POST | `/api/templates/inspect` | `{ref}`（模板 id 或路径） | `{ok, template, template_path, nodes, node_list, vars, schema_title, sniff:{camera,positive,negative,sampler,latent,save,controlnet:{depth,pose},warn}}`；UI 格式模板 → 200 `{ok:false, error:"…请 Workflow → Export (API)"}` |
+| 6d | POST | `/api/controlnet/upload` | `{kind:"depth"\|"pose", data_url:"data:image/png;base64,…"}` | `{ok, kind, filename, subfolder, type, bytes, sha1, local}`；kind 非法或不是 PNG → 400；ComfyUI 离线 → 503（本地副本仍保留） |
+| 6e | POST | `/api/batch` | `{name?, base:{…相机/生成参数}, shots:[{label, params}], same_seed, seed}` | `{ok, batch_id, count, jobs:[{index,label,seed,prompt_id?,error?}]}`；最多 24 张，离线整单 503 + `jobs:[]` |
+| 6f | GET | `/api/batch?batch_id=…` | `batch_id` 可选 | 有 id → 该批逐张状态 `{state: done\|running\|queued\|error, progress, images}`；无 id → 最近 20 条 |
 | 7 | GET | `/api/comfy/models` | — | `{checkpoints, loras, samplers, schedulers, comfy_reachable, error}`；离线返回空数组 + `comfy_reachable:false`，不是 500 |
 | 8 | GET | `/api/gallery?limit=200` | `limit` 1–200（默认 200） | `{items:[{url, filename, local, mtime, size, seed?, prompt_id?}], out_dir}`，mtime 倒序 |
 | 8b | POST | `/api/gallery/clear` | — | `{ok:true, cleared:N}`（删图片与 `.json` sidecar） |
@@ -300,7 +349,7 @@ roll 在已被自身旋转的坐标系里量角，导致拖 30 度只出 15 度�
 | 10b | DELETE | `/api/ui_presets?name=…` | `name`（query 或 body） | `{ok:true, deleted:bool, name, ui_presets}` |
 | 11 | POST | `/api/interrupt` | — | `{ok:true}`；离线时也是 **200** + `{ok:false, error}` |
 | 12 | POST | `/api/open_folder` | — | `{ok:true, path}`；打不开 → 500 + `{ok:false, error, path}` |
-| 13 | GET | `/` 与静态路径 | — | 从 `studio/web` 提供（`.js` / `.mjs` 为 `text/javascript`，`/vendor/three.module.js` 可取）；越界 → 403 |
+| 13 | GET | `/` 与静态路径 | — | 从 `studio/web` 提供（`.js` / `.mjs` 为 `text/javascript`，`/js/three.module.js` 可取）；越界 → 403 |
 
 - **模板模式**：`workflow_template` 非空时**不再要求 `checkpoint`**（模板自带 checkpoint/LoRA），
   返回里 `template` 是命中的文件名、`warn` 是注入过程中的提醒（例如「模板没有 prompt 变量，已写入 KSampler 正向节点 11」）；

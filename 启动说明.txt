@@ -1,0 +1,95 @@
+SDXL 相机工作台 · 手动启动说明
+================================
+
+本副本（D:\DSh canera）已是 v2：焦距/FOV、roll ±45°、构图偏移 pan、
+主体朝向与视线解耦、极点消歧。参数与提示词映射见 README.md 与
+docs/sdxl_camera_mapping.md；改完代码先跑四项门禁：
+  python tests\test_core.py
+  python tools\parity_check.py
+  python tools\validate_workflow.py workflows\SDXL.CameraAngle.json
+  python studio\tools\check_ui.py
+
+位置：D:\DSh canera\
+服务端口：默认 8770，被占用会自动往上找（8770-8809）
+出图目录：D:\DSh canera\studio\out
+
+一、怎么启动
+
+  studio\launch.bat          唯一启动入口：起服务 + 打开界面（默认浏览器）
+  studio\launch.vbs          同上，但无黑窗口（更像桌面软件）
+  studio\launch.py           命令行启动，可加 --no-browser / --port 自己粘地址（排错首选）
+
+  双击后会出现一个黑窗口，里面会打印类似：
+      [studio] http://127.0.0.1:8770
+      [launch] http://127.0.0.1:8770/
+  这个窗口就是服务本体，别关；关掉窗口 = 停止服务。
+  关窗之后想再用，再双击一次即可。
+
+二、前置条件
+
+  1) ComfyUI 要在跑：http://127.0.0.1:8188
+     没跑也能打开界面、拖摄像机、看提示词，只是点“生成图片”会报 ComfyUI 未启动。
+  2) Python 用 ComfyUI 自带的那只：
+     D:\QUARK\ComfyUI-aki-v3.2\python\python.exe
+     脚本里已经按这个路径找；找不到会退回命令行里的 python。
+     不需要 pip install 任何东西（后端只用标准库，three.js 是本地文件）。
+
+三、浏览器没自动打开的解决办法
+
+  Windows 的权限问题：如果系统里已经有一个“以管理员身份运行”的 Edge，
+  普通权限的程序再去启动 Edge 会被系统拦下，界面就不会弹出来。
+  处理办法（任选）：
+
+  (a) 看黑窗口里打印的 http://127.0.0.1:8770/ ，手动复制到浏览器地址栏；
+  (b) 彻底退出所有 Edge（包括右下角托盘里的），再双击 启动.bat；
+  (c) 直接用 仅服务-手动开浏览器.bat ，然后自己开浏览器。
+
+  如果看到「Microsoft Edge 未响应，因为现有实例正在以提升的权限运行。
+  是否要用普通权限重启现有实例？」——点“否”。
+  点“是”会把你当前所有浏览器窗口关掉重启。
+
+四、怎么用界面
+
+  左侧 3D 视图：
+      拖粉点     = 改方位（绕人转一圈）
+      拖青点     = 改高度（仰视 / 平视 / 俯视）
+      滚轮       = 改距离（特写 / 近景 / 中景 / 全身 / 远景）
+      拖滑块     = 精细调节（含倾斜 dutch angle）
+  右侧：
+      正向 / 负向提示词实时刷新，可一键复制；
+      生成设置里选 checkpoint、步数、CFG、尺寸、LoRA 强度；
+      “工作流模板（可选）”：留空用内置最小图（checkpoint + LoRA 直出）；
+      选了模板（例如 feiyue-sam3-t2i / feiyue-sam3-posetags）就把相机词注入那个
+      生产工作流再跑，模板里的 detailer / 姿势库全部保留；“姿势 id”等价于
+      template_vars.pose（模板带姿势库时才有意义）。
+      点“生成图片”提交给 ComfyUI，出图后自动进画廊，点图可放大。
+      模板来源：ComfyUI 里“导出（API）”出来的 JSON，放在
+      C:\Users\<你>\.dsh-comfyui-workbench\workflows\ 立刻出现在下拉里。
+
+五、改参数
+
+  启动.bat 支持透传参数，例如：
+      启动.bat --port 8790
+      启动.bat --comfy http://127.0.0.1:8188
+  常驻配置在 studio\state\config.json（comfy_url、默认步数、尺寸等）。
+
+六、和 ComfyUI 插件节点的关系
+
+  D:\QUARK\sdxl_camera_angle 那份仍然可以当 ComfyUI 自定义节点用
+  （节点名“SDXL 相机控制”）。本目录这一份是独立桌面版，不需要装进 ComfyUI，
+  两边共用同一套核心算法 core\camera_core.py。
+
+七、完整文档
+
+  studio\README.md —— 界面说明、参数语义（pos_x/pos_y/pos_z/roll 每一档的公式）、
+  预设表、HTTP API、常见问题。
+三、写不进去（PermissionError / config.json 保存失败）
+
+  症状：控制台一直刷
+      PermissionError: [Errno 13] Permission denied: ...\studio\state\config.json.xxxx.tmp
+  原因：launch.bat 优先用 ComfyUI 便携版 python，它是「低完整性」进程，
+        只能写带低完整性标签的目录；项目搬到普通目录后就被 Windows 挡住。
+  修法（一行，对项目目录打标签，子目录自动继承）：
+      icacls "D:\DSh canera" /setintegritylevel (OI)(CI)L
+  之后重开服务即可。体检：
+      "D:\QUARK\ComfyUI-aki-v3.2\python\python.exe" tools\check_env.py

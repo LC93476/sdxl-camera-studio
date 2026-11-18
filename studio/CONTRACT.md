@@ -12,7 +12,7 @@
 | studio/comfy_bridge.py | backend | ComfyUI 图构建 / 提交 / 轮询 / 取图 |
 | studio/store.py | backend | config.json / presets.json、输出目录、画廊索引 |
 | studio/web/index.html, styles.css, app.js, camera3d.js | frontend | 全部前端 |
-| studio/web/vendor/three.module.js | frontend | 从 ../js/three.module.js 复制 |
+| js/three.module.js, js/camera_shared.js | Lead | 仓库根唯一一份，studio 通过 `/js/<file>` 静态路由复用（studio/web/vendor/ 已删除，勿再引用） |
 | studio/launch.bat, launch.vbs, launch.ps1, 桌面快捷方式 | Lead | 启动器/桌面壳 |
 | studio/tools/e2e_test.py, check_ui.py | qa | 端到端与 UI 契约测试 |
 | studio/state/, studio/out/ | runtime | 运行时数据 |
@@ -64,7 +64,7 @@ neg_strength ∈ [0,2]，weight_mode ∈ {tanh, linear, raw}，azimuth_mode ∈ 
 10. POST /api/ui_presets {name, vals:[x,y,z,roll]} / DELETE /api/ui_presets?name=…
 11. POST /api/interrupt → 转发 /interrupt 给 ComfyUI
 12. POST /api/open_folder → explorer 打开 out 目录
-13. GET / 与静态路径 → 从 studio/web 提供（.js/.mjs 必须是 text/javascript）；/vendor/three.module.js 必须可取。
+13. GET / 与静态路径 → 从 studio/web 提供（.js/.mjs 必须是 text/javascript）；/js/three.module.js 与 /js/camera_shared.js 必须经 `/js/<file>` 可取。
 
 错误统一 HTTP 4xx/5xx + {error:str}。除 /api/generate 外任何路由不得因 ComfyUI 离线而 500。
 
@@ -132,4 +132,67 @@ btn_hud_toggle, btn_export_presets, btn_import_presets, import_file
 - 预设：btn_save_preset 保存当前全部 v2 参数；btn_export_presets 走 /api/ui_presets/export；btn_import_presets + import_file 走 import。
 - 3D 复用：studio/web/camera3d.js 必须 import "/js/three.module.js" 与 "/js/camera_shared.js"；
   studio/web/vendor/three.module.js 已删除，不要再引用。
+## v2.3 增补（共享 3D 核心 / ControlNet 导出 / 任意工作流注入 / 批量队列）
+
+### 归属（v2.3）
+
+| 路径 | 归属 | 说明 |
+|---|---|---|
+| js/camera_rig.js | studio-fe | 唯一一份 Three.js 场景核心（场景/人体/视线锥/动态视锥/九宫格/按需渲染/离屏导出） |
+| studio/web/camera3d.js | studio-fe | 变成薄壳：import CameraRig → 绑定 DOM 滑块 + 事件，不得再自建 scene |
+| js/sdxl_camera_widget.js | studio-fe | 用 CameraRig({compact:true}) 替掉自建 scene / 手柄 / 渲染循环 |
+| studio/template_bridge.py, studio/comfy_bridge.py, studio/server.py | studio-be | 工作流嗅探、注入、上传、批量队列后端 |
+| studio/web/app.js, index.html, styles.css | studio-frontend | 预览/导出/批量网格 UI |
+| pyproject.toml, requirements.txt, .github/workflows/ci.yml, tools/token_count.py, tools/verify_repo.py, start_studio.bat | studio-qa | 打包与 CI 门禁 |
+| core/*, js/camera_shared.js, tools/parity_check.py, tests/*, docs/*, README.md, SPEC.md | Lead | 真源与文档 |
+
+### js/camera_rig.js（双端共享 3D 核心）
+
+```js
+import { CameraRig } from "/js/camera_rig.js";
+const rig = new CameraRig(canvasEl, { compact: true, interactive: true,
+                                     onChange: s => {}, onCommit: s => {} });
+rig.setState({ pos_x, pos_y, pos_z, roll, focal, pan_x, pan_y, subject_yaw, gaze_mode });
+rig.getState();            // 同 setState 的键，数值已 clamp
+rig.applyShot(n);          // 1..6 标准机位
+rig.toggleGrid(true); rig.toggleFrustum(true);
+rig.setRefImage(url); rig.setRefOpacity(0.4);
+rig.resize(); rig.dispose();
+// v2.3 新增离屏导出（返回 data URL，image/png）：
+rig.renderDepthDataURL(512, 768, { invert: true });  // 白=近 黑=远，ControlNet depth 口径
+rig.renderPoseDataURL(512, 768);                     // OpenPose 18 点标准配色骨架，黑底
+```
+
+要求：
+1. `compact:true` 时不依赖任何外部 DOM id、不注册 document 级键盘监听、尺寸取 canvas 自身或 320×300；`interactive:false` 时不绑指针事件。
+2. 场景内容必须与现 studio/web/camera3d.js 等价：网格 + 人体标定模型 + 视线锥 + 主体朝向箭头 + 方位环/高度弧/距离管 + 动态视锥线框 + 三分法九宫格 + 地平线 + 参考图叠层。
+3. 按需渲染：状态变化 `invalidate()` → 单帧 raf；静止 0 帧；`dispose()` 释放 geometry/material/renderer。
+4. 离屏导出复用同一份场景与相机（不改当前 viewport 尺寸），渲完必须恢复 renderer 状态；导出 canvas 用完 dispose。
+5. 深度导出用 `THREE.MeshDepthMaterial`（`depthPacking: THREE.BasicDepthPacking`），近裁剪面对应白色；输出 `background = 0x000000`。
+6. 骨架导出：18 点 keypoint（0 鼻 1 颈 2 右肩 3 右肘 4 右腕 5 左肩 6 左肘 7 左腕 8 右髋 9 右膝 10 右踝 11 左髋 12 左膝 13 左踝 14 右眼 15 左眼 16 右耳 17 左耳），
+   连接对 (1,2)(1,5)(2,3)(3,4)(5,6)(6,7)(1,8)(8,9)(9,10)(1,11)(11,12)(12,13)(1,0)(0,14)(14,16)(0,15)(15,17)，
+   投影用当前相机 `project()`，线与点按 OpenPose 官方配色（右=红 #ff0000 / 左=蓝 #0000ff / 中=黄 #ffff00），黑底。
+
+### 后端新增端点（v2.3，全部 JSON）
+
+1. `POST /api/controlnet/upload` body `{kind:"depth"|"pose", data_url, name?}` → 把 data URL 解码后经 ComfyUI `POST /upload/image`(multipart, type=input) 上传，
+   返回 `{ok, kind, filename, subfolder:"", type:"input", bytes}`；ComfyUI 离线 503 `{error}`；data_url 非法 400。
+2. `POST /api/templates/inspect` body `{ref}`（模板 id 或路径）→ `{ok, template, nodes, sniff:{camera, positive, negative, sampler, latent, save, controlnet:{depth:[{node,field}],pose:[...]}}, warn:[...]}`，
+   用于前端显示「这条工作流会被注入哪几个节点」。嗅探规则：优先 `CameraAngleSDXL` 节点（直接用其 positive/negative 输出），否则用 KSampler.positive/negative 指向的 `CLIPTextEncode*`。
+3. `POST /api/batch` body `{name?:"三视图", base:{相机+生成参数}, shots:[{label, params}], same_seed:true, seed}` → `{ok, batch_id, seed, jobs:[{label, prompt_id, seed, positive, negative}]}`；逐张 submit（同一 seed 时共用），ComfyUI 离线整单 503 不半提交。
+4. `GET /api/batch?batch_id=…` → `{ok, batch_id, state:"queued"|"running"|"done"|"error", done, total, jobs:[{label, prompt_id, state, progress, images:[{filename,url}]}]}`，内部复用 progress 逻辑。
+5. `POST /api/preview` 不变；`POST /api/generate` 追加可选 `template` 与 `template_vars`（含 `controlnet_depth` / `controlnet_pose` 已上传的 filename），注入失败只 warn 不改结构。
+
+### 前端新增 DOM id（v2.3，必须存在）
+
+`btn_depth_export, btn_pose_export, depth_preview, pose_preview, cn_auto_inject, cn_kind_select, cn_strength,`
+`template_select, btn_template_inspect, template_report, batch_name, batch_seed, batch_same_seed, btn_batch_run, batch_grid, batch_status`
+
+### 前端交互（v2.3）
+
+- 导出：点 `btn_depth_export` / `btn_pose_export` → `rig.renderDepthDataURL(512,768)` / `renderPoseDataURL(512,768)` → 填入 `depth_preview` / `pose_preview`（`<img>`）并 POST `/api/controlnet/upload`；
+  勾了 `cn_auto_inject` 时把返回 filename 记进生成参数（`template_vars.controlnet_depth|pose`）。
+- 批量：`batch_seed` 锁定同一 seed，`btn_batch_run` 读内置序列（或当前 N 个机位）→ POST `/api/batch` → 轮询 `GET /api/batch`，`batch_grid` 网格并排显示进度与成品（含 label 与 seed）。
+- 模板：`template_select` 列出 /api/templates → `btn_template_inspect` 显示 `template_report`（哪条被注入、有无 CameraAngleSDXL、ControlNet 槽位）。
+- 所有新控件断线（后端 503）时只显示错误文案，不得抛异常中断页面。
 

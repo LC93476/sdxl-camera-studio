@@ -3,8 +3,10 @@
 把 [Comfyui-Anima_camera_angle](https://github.com/xunying7860/Comfyui-Anima_camera_angle) 的
 「相机角度控制」原理移植到 **SDXL**，并补上手调摄像机直接出图。
 
-它不是 LoRA、不是 ControlNet，**纯粹是提示词权重生成器**：3D 相机参数 → 自然语言摄影术语 +
+它的主体是**提示词权重生成器**：3D 相机参数 → 自然语言摄影术语 +
 权重 → 拼成 `(tag:w), (tag:w)` 丢给 CLIPTextEncode；同时产出**负向镜像**压制反方向。
+不换模型、不加 LoRA；v2.3 起多一项**可选**能力：把 3D 视口导出的深度图 / OpenPose 骨架图
+喂给你自己的 ControlNet（见 [v2.3 新能力](#v23-新能力controlnet-深度骨架--工作流嗅探--多机位批量)）。
 
 ```
 pos_x / pos_y / pos_z / roll ──► CameraAngleSDXL ──► positive ──► CLIPTextEncode(正向) ──► KSampler
@@ -275,6 +277,57 @@ python tools/sweep_camera.py --mode sequence     # 三视图 / 推拉序列
 
 自动拼对比图 —— 用来标定你的底模到底吃不吃角度词。
 
+**方式六：Start Studio 入口**。根目录 `start_studio.bat` 与 `studio\launch.bat` 等价（自动找 python，
+找不到就回退 ComfyUI 便携版），双击即起服务 + 开浏览器。
+
+## v2.3 新能力：ControlNet 深度/骨架 + 工作流嗅探 + 多机位批量
+
+### 1. 3D 视口的深度图 / 骨架图（ControlNet 联动）
+
+`js/camera_rig.js` 里 `CameraRig` 现在能在**离屏**渲染两张可直接当 ControlNet 输入用的图，
+镜头与你在 3D 视口里调的那个机位**完全一致**：
+
+| 方法 | 输出 | 口径 |
+|---|---|---|
+| `renderDepthDataURL(w, h, {invert:true})` | `data:image/png;base64,...` | ControlNet depth：**白 = 近，黑 = 远**，背景填远端（不会把空景标成贴脸） |
+| `renderPoseDataURL(w, h)` | 同上 | OpenPose 18 点，右侧红 / 左侧蓝 / 中轴黄，黑底 |
+
+工作台里的用法：右侧「ControlNet」卡 → 点「导出深度」或「导出骨架」→ 预览图出现 → 自动 `POST /api/controlnet/upload`
+（后端用 ComfyUI 的 `/upload/image` 落到 `input/`，本地另存一份 `studio/state/controlnet/`）→
+勾上「自动注入」后，提交时写进 `template_vars.controlnet_depth` / `controlnet_pose` + `controlnet_strength`。
+
+`workflows/SDXL.CameraAngle.ControlNet.json` 是**双槽**示例：节点 10 吃 depth（0.65 / end 0.85），节点 13 吃 pose
+（0.45 / end 0.6，串在 depth 下游），两个变量会分别落到这两个槽位。导出还会**按主体自动贴框**
+（两轴取较大距离，横幅也不裁切），所以 depth 与 pose 的轮廓天然对齐。
+
+实测（本机，512×768）：depth 导出 27.7 KB（白=近、四角纯黑、人物占 81% 画幅）、pose 26.1 KB，两者外接框中心偏差 0 px；
+只发 depth → 出图是侧身白裙少女（轮廓贴合）；depth+pose 一起发 → 侧身 3/4 红大衣夜景，骨架与轮廓都吃住，
+`/api/generate` 全程 `warn` 为空。
+
+### 2. 任意 API 格式工作流嗅探
+
+`studio/template_bridge.py` 不认死节点 id，按 `class_type` + 图结构回溯：
+
+- 相机节点 `CameraAngleSDXL` → 直接把机位词写进它的 `extra_positive` / `extra_negative`；
+- 正/负提示词顺 KSampler 的正负 conditioning 链**穿过** `ControlNetApplyAdvanced` / `ConditioningConcat` 找到真正的 `CLIPTextEncode`，只替换文本、不打断原有连线；
+- 采样器 / latent / SaveImage / ControlNet 槽位全部认出来；
+- 你选的是 **UI 格式**（ComfyUI 里直接保存的 JSON）会明确报「请 Workflow → Export (API)」，不会静默出错。
+
+工作台「工作流模板」卡的下拉里选中一个模板 → 点「嗅探」→ 报告里能看到它认出了哪些节点、有没有 ControlNet 槽位、有什么风险提示。
+
+### 3. 多机位批量队列
+
+「批量队列」卡：选序列（三视图 / 环绕 8 机位 / 推拉 / 俯仰）→ 填 seed（`-1` 随机）→ 勾「同 seed」→ 提交。
+后端 `POST /api/batch` 一次排队（上限 24 张），同 seed 时每张只换机位参数，出图后在 `#batch_grid`
+里**并排对比**，点任意一张开大图。任务记录落 `studio/state/batches.json`（保留最近 50 条）。
+
+### 4. 仓库工程化
+
+- `pyproject.toml`（ComfyUI Registry 规范）+ `requirements.txt`（零第三方依赖）；
+- `.github/workflows/ci.yml`：push/PR 自动跑门禁（python 3.10 / 3.12）；
+- `tools/verify_repo.py`：仓库自检（关键文件、图片白名单、不该提交的目录、已下线脚本是否真删）；
+- 发布脚本 `publish_github.py` / `recreate_public.py` / `publish_final.py` 与根 `发布到GitHub.bat` 已移到 `archive/`，只在需要时手动跑。
+
 ## 常见问题
 
 | 现象 | 原因 | 处理 |
@@ -365,15 +418,17 @@ icacls "D:\DSh canera" /setintegritylevel (OI)(CI)L
 cd D:/QUARK/sdxl_camera_angle
 export PYTHONIOENCODING=utf-8          # Windows 下中文输出必须
 
-python tests/test_core.py              # 1) 15 组算法单测
-python tools/parity_check.py           # 2) Python ↔ js/camera_shared.js 常量/词表逐字一致
+python tests/test_core.py              # 1) 17 组算法单测（含世界系 yaw、极点锁存、token 预算）
+python tools/parity_check.py           # 2) Python ↔ js/camera_shared.js 常量/词表/预算逐字一致
 python tools/validate_workflow.py workflows/SDXL.CameraAngle.json   # 3) 工作流 widgets ↔ 节点 INPUT_TYPES
-python studio/tools/check_ui.py        # 4a) 工作台静态契约
-python studio/tools/e2e_test.py        # 4b) 工作台接口 + 真实出图（需要 ComfyUI 在线）
+python tools/verify_repo.py            # 4) 仓库自检（文件清单 / 图片白名单 / 目录洁净 / 下线脚本）
+
+python studio/tools/check_ui.py        # 附加 a) 工作台静态契约
+python studio/tools/e2e_test.py        # 附加 b) 工作台接口 + 真实出图（需要 ComfyUI 在线）
 ```
 
-当前状态：**15 组单测全过 / parity TOTAL 差异 0 / 工作流 9 节点 13 连线全对齐 / check_ui 11 项 PASS /
-e2e PASS 13 FAIL 0 SKIP 1**。
+当前状态：**17 组单测全过 / parity TOTAL 差异 0 / 工作流 9 节点 13 连线全对齐 / verify_repo PASS 44 FAIL 0 /
+check_ui 11 项 PASS / e2e --no-generate PASS 11 FAIL 0 SKIP 2**。CI 在 push / PR 时自动跑前四条。
 
 单测覆盖：权重曲线校验值、8 档方位 + 双档插值、`az_gate`/`pole_gate` 门控、距离 6 档边界、
 焦距 6 档 + FOV、roll ±45° 阈值、三分法构图、主体朝向与视线解耦（含回眸）、极点互斥词剔除、
@@ -402,21 +457,24 @@ e2e PASS 13 FAIL 0 SKIP 1**。
 
 ## 发布到 GitHub
 
-仓库已经 `git init` 好、`.gitignore` 排除了出图与扫参产物，直接推即可：
+仓库已经 `git init` 好、`.gitignore` 排除了出图与扫参产物，用原生 git 推即可（v2.3 起不再内置发布脚本，
+个人 token 不该进公开仓库；旧脚本已归档在 `archive/`，只作历史参考）：
 
 ```bat
-REM 1) 只在本地整理并提交，不联网
-python tools/publish_github.py --local-only
+REM 1) 看这次要提交什么
+git status --short
 
-REM 2) 连仓库一起建（token 需要 repo 权限），建成后立刻推送
-python tools/publish_github.py --name sdxl-camera-studio --token ghp_xxx --public
+REM 2) 提交
+git add -A
+git commit -m "描述这次改动"
 
-REM 3) 仓库已在网页上建好，推到已有仓库
-python tools/publish_github.py --repo https://github.com/<你>/<仓库>.git --token ghp_xxx
+REM 3) 推到已有仓库（把 URL 换成你自己的；首次会提示输入用户名与 token）
+git remote add origin https://github.com/<你>/<仓库>.git
+git push -u origin main
 ```
 
-也可以直接双击 `发布到GitHub.bat`（不带参数 = 只整理本地）。token 也可以用环境变量
-`GITHUB_TOKEN` 传，脚本推完会把 `origin` 还原成不含 token 的干净地址。
+token 推荐用 `gh auth login` 或凭据管理器保存，**不要**写进命令行或 `.git/config`：
+提交前 `grep -c ghp_ .git/config` 应该是 0。
 
 ## 许可
 

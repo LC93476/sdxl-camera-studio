@@ -14,6 +14,9 @@
 """
 
 import argparse
+import base64
+import binascii
+import hashlib
 import json
 import math
 import os
@@ -33,6 +36,9 @@ ROOT = os.path.dirname(HERE)
 CORE_DIR = os.path.join(ROOT, "core")
 TOOLS_DIR = os.path.join(ROOT, "tools")
 JS_DIR = os.path.join(ROOT, "js")
+STATE_DIR = os.path.join(HERE, "state")
+CN_DIR = os.path.join(STATE_DIR, "controlnet")
+BATCHES_PATH = os.path.join(STATE_DIR, "batches.json")
 for _p in (CORE_DIR, HERE, TOOLS_DIR):
     if _p not in sys.path:
         sys.path.insert(0, _p)
@@ -55,6 +61,12 @@ except Exception:  # noqa: BLE001
 VERSION = "1.0"
 MAX_BODY = 4 * 1024 * 1024
 MAX_TASKS = 60
+MAX_BATCH_SHOTS = 24
+MAX_BATCH_RECORDS = 50
+CN_MAX_BYTES = 8 * 1024 * 1024
+CN_DATA_PREFIX = "data:image/png;base64,"
+CN_MAGIC = b"\x89PNG\r\n\x1a\n"
+BATCH_LOCK = threading.Lock()
 
 CAM_KEYS = (
     "pos_x", "pos_y", "pos_z", "roll", "preset", "strength",
@@ -654,6 +666,11 @@ def _gen_params(body, cfg):
     if pose_id:
         gen["template_vars"].setdefault("pose", pose_id)
 
+    # v2.3：body.template 是 /api/templates 里的模板 id 或路径（等价于 workflow_template）
+    template = str(body.get("template") or "").strip()
+    if template and not gen["workflow_template"]:
+        gen["workflow_template"] = template
+
     if gen["workflow_template"] and not gen["checkpoint"]:
         # 模板自带 checkpoint，不需要前端再选（缺了也只有内置图才必须）
         gen["checkpoint"] = ""
@@ -696,8 +713,9 @@ def api_generate(body):
     template_warn = []
     template_name = ""
     try:
-        graph, graph_meta = BRIDGE.build_graph(gen, preview["positive"], preview["negative"])
-        template_warn = list(graph_meta.get("warn") or [])
+        graph, graph_meta = _build_graph_safe(
+            gen, preview["positive"], preview["negative"], template_warn)
+        template_warn.extend(list(graph_meta.get("warn") or []))
         template_name = str(graph_meta.get("template") or "")
         prompt_id = BRIDGE.submit(graph)
     except comfy_bridge.ComfyError as exc:
@@ -807,8 +825,10 @@ def api_sequence(body):
         preview = plan["preview"]
         gen = dict(plan["gen"])
         gen["seed"] = seeds[idx]
+        shot_warn = []
         try:
-            graph, graph_meta = BRIDGE.build_graph(gen, preview["positive"], preview["negative"])
+            graph, graph_meta = _build_graph_safe(
+                gen, preview["positive"], preview["negative"], shot_warn)
             prompt_id = BRIDGE.submit(graph)
         except comfy_bridge.ComfyError as exc:
             return 502, {
@@ -842,7 +862,7 @@ def api_sequence(body):
             "negative": preview["negative"],
             "params": preview["params"],
             "template": str(graph_meta.get("template") or ""),
-            "warn": list(graph_meta.get("warn") or []),
+            "warn": shot_warn + list(graph_meta.get("warn") or []),
         })
 
     return 200, {
@@ -851,6 +871,377 @@ def api_sequence(body):
         "desc": str(seq.get("desc") or ""),
         "same_seed": bool(same_seed),
         "shots": results,
+    }
+
+
+# ══════════════════════ v2.3：模板注入兜底 / ControlNet 上传 / 批量队列 ══════════════════════
+def _build_graph_safe(gen, positive, negative, warn):
+    """建图；模板注入失败只记 warn 并回退内置最小图，绝不把 500 抛到路由层。"""
+    try:
+        return BRIDGE.build_graph(gen, positive, negative)
+    except comfy_bridge.ComfyError as exc:
+        tpl = str((gen or {}).get("workflow_template") or "").strip()
+        if not tpl:
+            raise
+        warn.append("模板注入失败，已回退内置图: %s" % exc)
+        alt = dict(gen)
+        alt["workflow_template"] = ""
+        return BRIDGE.build_prompt(alt, positive, negative), {
+            "template": "", "warn": [], "fallback": True,
+        }
+
+
+def _empty_sniff():
+    return {"camera": [], "positive": [], "negative": [], "sampler": "", "latent": "",
+            "save": "", "controlnet": {"depth": [], "pose": []}, "warn": []}
+
+
+def api_templates_inspect(body):
+    """POST /api/templates/inspect：模板 id / 路径 → 会被注入哪几个节点。"""
+    body = body if isinstance(body, dict) else {}
+    ref = str(body.get("ref") or body.get("template") or "").strip()
+    if not ref:
+        return 400, {"ok": False, "error": "ref 必填（模板 id 或路径）",
+                     "template": "", "nodes": 0, "sniff": _empty_sniff(), "warn": []}
+    try:
+        import template_bridge
+    except Exception as exc:  # noqa: BLE001
+        return 503, {"ok": False, "error": "template_bridge 不可用: %s" % exc,
+                     "template": ref, "nodes": 0, "sniff": _empty_sniff(), "warn": []}
+    try:
+        info = template_bridge.inspect(ref)
+    except template_bridge.TemplateError as exc:
+        return 200, {"ok": False, "error": str(exc), "template": ref, "nodes": 0,
+                     "node_list": [], "vars": [], "sniff": _empty_sniff(),
+                     "warn": [str(exc)]}
+    except Exception as exc:  # noqa: BLE001
+        return 200, {"ok": False, "error": "inspect 失败: %s" % exc, "template": ref,
+                     "nodes": 0, "node_list": [], "vars": [],
+                     "sniff": _empty_sniff(), "warn": [str(exc)]}
+
+    sniff = {key: info.get(key) for key in
+             ("camera", "positive", "negative", "sampler", "latent", "save", "controlnet")}
+    payload = {
+        "ok": True,
+        "template": info.get("template") or "",
+        "template_path": info.get("template_path") or "",
+        "nodes": int(info.get("nodes") or 0),
+        "node_list": list(info.get("node_list") or []),
+        "vars": list(info.get("vars") or []),
+        "schema_title": info.get("schema_title") or "",
+        "sniff": sniff,
+        "warn": list(info.get("warn") or []),
+    }
+    payload.update(sniff)  # 同时给扁平字段，前端老写法也能读
+    return 200, payload
+
+
+def api_controlnet_upload(body):
+    """POST /api/controlnet/upload：data URL → ComfyUI input/（顺带存一份本地副本）。"""
+    body = body if isinstance(body, dict) else {}
+    kind = str(body.get("kind") or "").strip().lower()
+    if kind not in ("depth", "pose"):
+        return 400, {"error": 'kind 只能是 "depth" 或 "pose"', "kind": kind}
+    data_url = str(body.get("data_url") or "").strip()
+    if not data_url.startswith(CN_DATA_PREFIX):
+        return 400, {"error": "data_url 必须是 data:image/png;base64,... 形式的 PNG data URL"}
+    try:
+        blob = base64.b64decode(data_url[len(CN_DATA_PREFIX):], validate=False)
+    except (binascii.Error, ValueError) as exc:
+        return 400, {"error": "base64 解码失败: %s" % exc}
+    if not blob:
+        return 400, {"error": "PNG 内容为空"}
+    if not blob.startswith(CN_MAGIC):
+        return 400, {"error": "解码结果不是 PNG（缺 PNG 文件头）"}
+    if len(blob) > CN_MAX_BYTES:
+        return 413, {"error": "PNG 太大（上限 %d 字节）" % CN_MAX_BYTES, "bytes": len(blob)}
+
+    digest = hashlib.sha1(blob).hexdigest()
+    filename = "cn_%s_%s.png" % (kind, digest[:8])
+    rel = "controlnet/" + filename
+    local = os.path.join(CN_DIR, filename)
+    local_error = ""
+    try:
+        os.makedirs(CN_DIR, exist_ok=True)
+        with open(local, "wb") as fh:
+            fh.write(blob)
+    except OSError as exc:
+        local_error = str(exc)
+        sys.stdout.write("[studio] controlnet 本地副本写失败: %s\n" % exc)
+        sys.stdout.flush()
+
+    payload = {
+        "ok": True,
+        "kind": kind,
+        "filename": filename,
+        "subfolder": "",
+        "type": "input",
+        "bytes": len(blob),
+        "sha1": digest,
+        "local": rel,
+    }
+    if local_error:
+        payload["local_error"] = local_error
+    try:
+        up = BRIDGE.upload_image(blob, filename, subfolder="", image_type="input")
+    except comfy_bridge.ComfyError as exc:
+        # 离线：文件已落本地副本，文件名可复用；HTTP 层按契约回 503
+        out = dict(payload)
+        out.update({"ok": False, "error": str(exc), "comfy_url": BRIDGE.base})
+        return 503, out
+    payload["filename"] = str(up.get("name") or filename)
+    payload["subfolder"] = str(up.get("subfolder") or "")
+    payload["type"] = str(up.get("type") or "input")
+    return 200, payload
+
+
+# ---------- 批量队列（studio/state/batches.json） ----------
+def _load_batches():
+    try:
+        with open(BATCHES_PATH, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return {}
+    if isinstance(data, dict) and isinstance(data.get("batches"), dict):
+        return data["batches"]
+    return data if isinstance(data, dict) else {}
+
+
+def _save_batches(batches):
+    ordered = sorted(batches.items(), key=lambda kv: (kv[1] or {}).get("t0") or 0.0, reverse=True)
+    keep = dict(ordered[:MAX_BATCH_RECORDS])
+    try:
+        os.makedirs(os.path.dirname(BATCHES_PATH), exist_ok=True)
+        tmp = BATCHES_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump({"version": 1, "batches": keep}, fh, ensure_ascii=False, indent=2)
+        os.replace(tmp, BATCHES_PATH)
+    except OSError as exc:
+        sys.stdout.write("[studio] batches.json 落盘失败: %s\n" % exc)
+        sys.stdout.flush()
+    return keep
+
+
+def _remember_batch(record):
+    with BATCH_LOCK:
+        batches = _load_batches()
+        batches[record["batch_id"]] = record
+        _save_batches(batches)
+    return record
+
+
+def api_batch(body):
+    """POST /api/batch：任意机位列表 → 逐张 compute + submit；离线整单 503 不半提交。"""
+    body = body if isinstance(body, dict) else {}
+    name = str(body.get("name") or "批量").strip() or "批量"
+    base = body.get("base") if isinstance(body.get("base"), dict) else {}
+    shots_in = body.get("shots")
+    if not isinstance(shots_in, list) or not shots_in:
+        return 400, {"ok": False, "error": "shots 必须是非空数组: [{label, params}]"}
+    if len(shots_in) > MAX_BATCH_SHOTS:
+        return 400, {"ok": False, "error": "一次最多 %d 张" % MAX_BATCH_SHOTS,
+                     "count": len(shots_in)}
+    same_seed = _truthy(body.get("same_seed", True))
+    cfg = store.load_config()
+
+    plans = []
+    for idx, shot in enumerate(shots_in):
+        shot = shot if isinstance(shot, dict) else {}
+        params = shot.get("params") if isinstance(shot.get("params"), dict) else {}
+        over = dict(base)
+        over.update(params)
+        over.pop("base", None)
+        label = str(shot.get("label") or ("第 %d 张" % (idx + 1)))
+        try:
+            preview = build_preview(over, cfg)
+        except Exception as exc:  # noqa: BLE001
+            return 400, {"ok": False, "error": "第 %d 张参数算不出来: %s" % (idx + 1, exc),
+                         "label": label}
+        plans.append({"label": label, "preview": preview, "gen": _gen_params(over, cfg)})
+
+    if not plans[0]["gen"]["checkpoint"] and not plans[0]["gen"]["workflow_template"]:
+        return 400, {
+            "ok": False,
+            "error": "checkpoint 未选择：先 GET /api/comfy/models 取 checkpoints，再在 base 里带 checkpoint",
+            "hint": '例如 {"name": "三视图", "base": {"checkpoint": "Illustrious-XL-v1.0.safetensors"}, "shots": [{"label": "正面"}]}',
+            "checkpoints": api_models().get("checkpoints") or [],
+        }
+
+    try:
+        seed_in = int(float(body.get("seed", base.get("seed", -1))))
+    except (TypeError, ValueError):
+        seed_in = -1
+    randomize = body.get("randomize")
+    randomize = (seed_in < 0) if randomize is None else _truthy(randomize)
+    if randomize or seed_in < 0:
+        first = random.randrange(0, 2 ** 31)
+        seeds = [first if same_seed else random.randrange(0, 2 ** 31) for _ in plans]
+        seed_source = "random"
+    else:
+        fixed = seed_in & 0xFFFFFFFF
+        seeds = [fixed if same_seed else (fixed + i) & 0xFFFFFFFF for i in range(len(plans))]
+        seed_source = "fixed"
+    seed_used = seeds[0] if seeds else 0
+
+    # 在线判定放在任何 submit 之前：离线就是整单 503，一张都不进队列
+    if not BRIDGE.reachable():
+        return 503, {
+            "ok": False,
+            "error": "ComfyUI 未启动，整单未提交",
+            "comfy_url": BRIDGE.base,
+            "batch_id": "",
+            "name": name,
+            "seed": seed_used,
+            "same_seed": bool(same_seed),
+            "jobs": [],
+        }
+
+    batch_id = "b" + time.strftime("%Y%m%d%H%M%S") + os.urandom(2).hex()
+    jobs = []
+    for idx, plan in enumerate(plans):
+        preview = plan["preview"]
+        gen = dict(plan["gen"])
+        gen["seed"] = seeds[idx]
+        warn = []
+        try:
+            graph, graph_meta = _build_graph_safe(gen, preview["positive"], preview["negative"], warn)
+            prompt_id = BRIDGE.submit(graph)
+        except comfy_bridge.ComfyError as exc:
+            return 502, {
+                "ok": False,
+                "error": str(exc),
+                "comfy_url": BRIDGE.base,
+                "batch_id": batch_id,
+                "name": name,
+                "seed": seed_used,
+                "same_seed": bool(same_seed),
+                "jobs": jobs,
+                "failed_label": plan["label"],
+            }
+        with TASK_LOCK:
+            TASKS[prompt_id] = {
+                "prompt_id": prompt_id,
+                "t0": time.time(),
+                "steps": gen["steps"],
+                "seed": seeds[idx],
+                "seed_source": seed_source,
+                "images": None,
+                "gen": dict(gen),
+                "positive": preview["positive"],
+                "negative": preview["negative"],
+                "last_state": {"state": "queued", "progress": 0.0, "node": ""},
+            }
+            CURRENT["prompt_id"] = prompt_id
+            _trim_tasks()
+        jobs.append({
+            "label": plan["label"],
+            "prompt_id": prompt_id,
+            "seed": seeds[idx],
+            "positive": preview["positive"],
+            "negative": preview["negative"],
+            "params": preview["params"],
+            "template": str(graph_meta.get("template") or ""),
+            "warn": warn + list(graph_meta.get("warn") or []),
+        })
+
+    record = {
+        "batch_id": batch_id,
+        "name": name,
+        "seed": seed_used,
+        "same_seed": bool(same_seed),
+        "seed_source": seed_source,
+        "t0": time.time(),
+        "created": round(time.time(), 3),
+        "jobs": [{"label": j["label"], "prompt_id": j["prompt_id"], "seed": j["seed"]}
+                 for j in jobs],
+    }
+    _remember_batch(record)
+    return 200, {
+        "ok": True,
+        "batch_id": batch_id,
+        "name": name,
+        "seed": seed_used,
+        "same_seed": bool(same_seed),
+        "jobs": jobs,
+    }
+
+
+def api_batch_status(qs=None, batch_id=""):
+    """GET /api/batch：不带 batch_id 列最近记录，带了就聚合每张的进度。"""
+    if isinstance(qs, dict):
+        batch_id = batch_id or _one(qs, "batch_id")
+    batch_id = str(batch_id or "").strip()
+    with BATCH_LOCK:
+        batches = _load_batches()
+
+    if not batch_id:
+        recent = sorted(batches.values(), key=lambda r: (r or {}).get("t0") or 0.0, reverse=True)
+        return 200, {"ok": True, "batches": [{
+            "batch_id": r.get("batch_id"),
+            "name": r.get("name") or "",
+            "seed": r.get("seed"),
+            "same_seed": bool(r.get("same_seed")),
+            "total": len(r.get("jobs") or []),
+            "created": r.get("created"),
+        } for r in recent[:20]]}
+
+    record = batches.get(batch_id)
+    if not isinstance(record, dict):
+        return 404, {"ok": False, "error": "unknown batch_id: %s" % batch_id,
+                     "batch_id": batch_id}
+
+    jobs = []
+    done = 0
+    states = []
+    for job in record.get("jobs") or []:
+        prompt_id = str((job or {}).get("prompt_id") or "")
+        if prompt_id:
+            try:
+                prog = api_progress(prompt_id)
+            except Exception as exc:  # noqa: BLE001
+                prog = {"state": "error", "progress": 0.0, "images": [],
+                        "error": "progress 失败: %s" % exc}
+        else:
+            prog = {"state": "error", "progress": 0.0, "images": [], "error": "缺 prompt_id"}
+        state = str(prog.get("state") or "queued")
+        states.append(state)
+        if state == "done":
+            done += 1
+        entry = {
+            "label": (job or {}).get("label") or "",
+            "prompt_id": prompt_id,
+            "seed": (job or {}).get("seed"),
+            "state": state,
+            "progress": float(prog.get("progress") or 0.0),
+            "node": prog.get("node") or "",
+            "images": list(prog.get("images") or []),
+            "error": prog.get("error"),
+        }
+        if prog.get("warn"):
+            entry["warn"] = prog["warn"]
+        jobs.append(entry)
+
+    total = len(jobs)
+    if total and done == total:
+        state = "done"
+    elif any(s in ("running", "queued") for s in states):
+        state = "running" if (done or any(s == "running" for s in states)) else "queued"
+    elif any(s == "error" for s in states):
+        state = "error"
+    else:
+        state = "queued"
+
+    return 200, {
+        "ok": True,
+        "batch_id": batch_id,
+        "name": record.get("name") or "",
+        "seed": record.get("seed"),
+        "same_seed": bool(record.get("same_seed")),
+        "state": state,
+        "done": done,
+        "total": total,
+        "jobs": jobs,
+        "created": record.get("created"),
     }
 
 
@@ -971,6 +1362,9 @@ class StudioHandler(BaseHTTPRequestHandler):
                 return self._json(api_meta())
             if path == "/api/sequences":
                 return self._json(api_sequences())
+            if path == "/api/batch":
+                status, payload = api_batch_status(qs)
+                return self._json(payload, status)
             if path == "/api/ui_presets/export":
                 return self._export_presets()
             if path == "/api/comfy/models":
@@ -1035,6 +1429,15 @@ class StudioHandler(BaseHTTPRequestHandler):
                 return self._json({"ok": True, "added": int(added), "ui_presets": merged})
             if path == "/api/sequence":
                 status, payload = api_sequence(self._body())
+                return self._json(payload, status)
+            if path == "/api/controlnet/upload":
+                status, payload = api_controlnet_upload(self._body())
+                return self._json(payload, status)
+            if path == "/api/templates/inspect":
+                status, payload = api_templates_inspect(self._body())
+                return self._json(payload, status)
+            if path == "/api/batch":
+                status, payload = api_batch(self._body())
                 return self._json(payload, status)
             if path == "/api/open_folder":
                 _ok, payload = api_open_folder()

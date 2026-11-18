@@ -9,9 +9,8 @@ out/
 studio/out/
 *.log
 
-# 本机配置与用户预设（含本机端口 / ComfyUI 路径，不随仓库分发）
-studio/state/config.json
-studio/state/presets.json
+# 本机运行时状态（配置 / 用户预设 / 批次记录 / 上传的控制图，不随仓库分发）
+studio/state/
 
 # 编辑器 / 系统
 .vscode/
@@ -19,3 +18,6 @@ studio/state/presets.json
 Thumbs.db
 desktop.ini
 .DS_Store
+
+# 已下线的发布脚本（内容已归档到 archive/）
+/发布到GitHub.bat
